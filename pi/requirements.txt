@@ -1,0 +1,3 @@
+# M1 needs stdlib only. These come into play at M2 (websockets) and M3 (pyserial).
+websockets>=12.0
+pyserial>=3.5
