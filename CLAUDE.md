@@ -72,11 +72,13 @@ Quest twin (ghost+solid) ◀──wss "tm" ◀── PC ◀──"E,q1,q2,c1,c2"
 ## Conventions (do not drift from these)
 
 - **Coordinates:** WebXR is y-up; the horizontal plane is X/Z. The Quest sends
-  raw X/Z in **meters** always, plus `u,v ∈ [0,1]` once calibrated (A button =
-  near-left corner, B = far-right; u = depth/Z axis, v = lateral/X axis).
-  The host forwards u,v verbatim; the V5's `normalized_to_workspace()` maps
-  them to arm cm and its workspace rectangle already sits inside the reachable
-  annulus — no host-side clamp needed.
+  raw X/Z in **meters** always, plus `u,v ∈ [0,1]` = position inside the fixed
+  drawing panel (workspace proportions × PANEL_SCALE, placed with A; no
+  calibration; u = depth, v = lateral). The host applies SWAP_UV/FLIP_U/FLIP_V
+  (top of server/run.py — physical-orientation tuning, user-verified on
+  hardware) then forwards; the V5's `normalized_to_workspace()` maps to arm cm
+  inside the reachable annulus — no host-side clamp needed. Twin orientation:
+  TWIN_Q_SIGN / TWIN_YAW_DEG in quest/js/app.js, left stick rotates live.
 - **Angles:** degrees over the wire, arm frame (q1 at shoulder, q2 relative to
   link 1), gear ratio divided out.
 - **Rates:** Quest sends ~25 Hz (EMA-smoothed on the Quest). Host acts on the

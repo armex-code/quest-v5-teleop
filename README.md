@@ -60,14 +60,18 @@ Then: plug in the V5 and start its program → on the Quest open
 
 ### In the headset
 
+No calibration: a gridded blue panel with a yellow border — the robot's
+workspace rectangle, scaled ×1.5 — appears in front of you and is live
+immediately.
+
 | action | effect |
 |--------|--------|
-| Hold **right controller** at the **near-left** corner of where you want the drawing area, press **A** | set corner A |
-| Hold it at the **far-right** corner, press **B** | set corner B — arm is now live |
-| Move the right controller inside that rectangle | arm follows (25 Hz) |
+| Move the right controller over the panel | arm follows (25 Hz) |
 | **Right trigger** | pen down (flag is transported; no pen actuator fitted yet) |
+| **A** (right controller) | move the panel to the controller's position |
 | **X** (left controller) | pause / resume teleop (arm holds position, pen up) |
 | **Left grip** (hold) | grab/reposition the digital twin |
+| **Left thumbstick ◄ ►** | rotate the twin to match the real robot on the table |
 | **Right thumbstick click** | clear the pen trail on the twin |
 
 Orientation tuning lives at the top of `server/run.py` (`SWAP_UV`, `FLIP_U`,

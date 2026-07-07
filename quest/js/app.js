@@ -1,13 +1,14 @@
-// Quest → V5 teleop client (controllers only).
+// Quest → V5 teleop client (controllers only, fixed drawing panel).
 //
-// Flow guided by the HUD, step by step:
-//   connect → wake right controller → mark corner A → mark corner B → LIVE.
-// Right controller = the pen: A/B mark the drawing-area corners, trigger =
-// pen down, thumbstick click = clear trail. Left grip = move the twin.
-//
-// Visuals: translucent gridded panel spanning the calibrated drawing area
-// with a live cursor dot (red while the pen is down), yellow corner markers,
-// and the digital twin (solid = encoders, ghost = commanded, green trail).
+// No calibration: a gridded panel with the SAME proportions as the robot's
+// workspace (the yellow rectangle on the twin, scaled by PANEL_SCALE) appears
+// in front of the user and is immediately live. Controls:
+//   RIGHT controller = the pen. Trigger = pen down.
+//   A               = move the panel to the controller (re-place it anywhere)
+//   R-stick click   = clear the twin's pen trail
+//   X (left)        = pause / resume (arm holds, pen up)
+//   LEFT grip hold  = carry the digital twin
+//   LEFT stick ◄ ►  = rotate the twin to match the real robot on the table
 import * as THREE from 'three';
 
 const startBtn = document.getElementById('start');
@@ -20,9 +21,11 @@ const WS_PORT = 8765;
 const SEND_INTERVAL_MS = 40; // 25 Hz pose stream
 const EMA_ALPHA = 0.18;      // pose smoothing (higher = snappier)
 const TWIN_Q_SIGN = -1;      // set to 1 if the twin mirrors the real arm
+const TWIN_YAW_DEG = 90;     // default twin orientation; L-stick adjusts live
 const TWIN_SCALE = 0.006;    // meters per arm-cm → ~31 cm twin for a 51 cm arm
+const PANEL_SCALE = 1.5;     // drawing panel = workspace size × this factor
+const PANEL_POS = [0, 1.0, -0.45]; // default panel spot (relative to start)
 const TRAIL_MAX = 4000;      // points
-const MIN_CAL_SIZE = 0.05;   // corners closer than 5 cm on an axis = invalid
 
 let renderer, scene, camera;
 let hudCanvas, hudCtx, hudTexture;
@@ -42,19 +45,18 @@ let wsRetryMs = 1000;
 let seq = 0;
 let lastSend = 0;
 
-// Calibration + smoothing state
-const cal = { a: null, b: null };
+// Cursor / control state
 let ema = null;        // smoothed {x, z} of the right controller
-let lastRightY = 1.0;  // height of the right cursor (for the area visual)
 let lastUV = null;
+let penNow = false;
+let paused = false;    // X button: freeze the arm (server holds + raises pen)
 
 // Scene objects
 let twin = null;
+let twinYaw = THREE.MathUtils.degToRad(TWIN_YAW_DEG);
 let lastTm = null;
 let lastTipPos = null;
-let areaVis = null;    // { group, cursor, halfX, halfZ, center }
-let penNow = false;
-let paused = false;    // X button: freeze the arm (server holds + raises pen)
+let panel = null;      // { group, cursor, halfW, halfD }
 
 checkSupport();
 connectWS();
@@ -77,9 +79,10 @@ function connectWS() {
     if (msg.t === 'tm') {
       lastTm = msg;
     } else if (msg.t === 'cfg') {
-      const changed = msg.l1 !== cfg.l1 || msg.l2 !== cfg.l2;
+      const changed = msg.l1 !== cfg.l1 || msg.l2 !== cfg.l2
+        || JSON.stringify(msg.ws) !== JSON.stringify(cfg.ws);
       cfg = { l1: msg.l1, l2: msg.l2, ws: msg.ws || cfg.ws };
-      if (changed && twin) buildTwin();
+      if (changed && renderer) { buildTwin(); buildPanel(); }
     } else if (msg.t === 'st') {
       serialOk = !!msg.ok;
       serialMsg = msg.msg;
@@ -182,6 +185,7 @@ function initScene() {
   }
 
   buildTwin();
+  buildPanel();
 }
 
 // ── Digital twin ─────────────────────────────────────────────────────────────
@@ -229,12 +233,12 @@ function buildTwin() {
   if (old) scene.remove(old.group);
 
   const group = new THREE.Group();
-  // Float in front of where the user started; move it with LEFT grip.
+  // Float in front of where the user started; move it with LEFT grip,
+  // rotate it with the LEFT thumbstick to match the real robot.
   group.position.set(old ? old.group.position.x : 0.35,
                      old ? old.group.position.y : 1.05,
                      old ? old.group.position.z : -0.55);
-  // IK frame: +x is "forward" (the 18–48 cm band). Point it away from the user.
-  group.rotation.y = Math.PI / 2;
+  group.rotation.y = twinYaw;
 
   // Base plate sized to the arm's reach.
   const reach = (cfg.l1 + cfg.l2 + 3) * S;
@@ -318,108 +322,96 @@ function updateTwin() {
   }
 }
 
-// ── Drawing-area visual: gridded panel + corner markers + cursor dot ───────
+// ── Fixed drawing panel (same proportions as the robot workspace) ───────────
 
-function updateAreaVisuals() {
-  if (areaVis) { scene.remove(areaVis.group); areaVis = null; }
+function buildPanel() {
+  const old = panel;
+  if (old) scene.remove(old.group);
+
+  // Workspace: lateral span → panel width (x), depth span → panel depth (z).
+  const [latMin, latMax, fwdMin, fwdMax] = cfg.ws;
+  const w = (latMax - latMin) / 100 * PANEL_SCALE; // cm → m, scaled
+  const d = (fwdMax - fwdMin) / 100 * PANEL_SCALE;
+  const halfW = w / 2, halfD = d / 2;
 
   const group = new THREE.Group();
-  const cornerMat = new THREE.MeshBasicMaterial({ color: 0xffd60a });
-  for (const c of [cal.a, cal.b]) {
-    if (!c) continue;
-    const m = new THREE.Mesh(new THREE.SphereGeometry(0.014, 14, 10), cornerMat);
-    m.position.set(c.x, c.y ?? 1.0, c.z);
-    group.add(m);
+  group.position.set(...(old ? old.group.position.toArray() : PANEL_POS));
+
+  const fill = new THREE.Mesh(
+    new THREE.PlaneGeometry(w, d),
+    new THREE.MeshBasicMaterial({
+      color: 0x38c0ff, transparent: true, opacity: 0.12,
+      side: THREE.DoubleSide, depthWrite: false,
+    }),
+  );
+  fill.rotation.x = -Math.PI / 2;
+  group.add(fill);
+
+  // Grid: 8 divisions each way.
+  const gpts = [];
+  const N = 8;
+  for (let i = 0; i <= N; i++) {
+    const fx = -halfW + (w * i) / N;
+    const fz = -halfD + (d * i) / N;
+    gpts.push(new THREE.Vector3(fx, 0.001, -halfD),
+              new THREE.Vector3(fx, 0.001, halfD));
+    gpts.push(new THREE.Vector3(-halfW, 0.001, fz),
+              new THREE.Vector3(halfW, 0.001, fz));
   }
+  group.add(new THREE.LineSegments(
+    new THREE.BufferGeometry().setFromPoints(gpts),
+    new THREE.LineBasicMaterial({
+      color: 0x38c0ff, transparent: true, opacity: 0.35,
+    }),
+  ));
 
-  let cursor = null, halfX = 0, halfZ = 0, center = null;
-  if (cal.a && cal.b) {
-    const dx = Math.abs(cal.b.x - cal.a.x);
-    const dz = Math.abs(cal.b.z - cal.a.z);
-    if (dx >= MIN_CAL_SIZE && dz >= MIN_CAL_SIZE) {
-      const cx = (cal.a.x + cal.b.x) / 2;
-      const cz = (cal.a.z + cal.b.z) / 2;
-      const cy = ((cal.a.y ?? 1.0) + (cal.b.y ?? 1.0)) / 2;
-      center = new THREE.Vector3(cx, cy, cz);
-      halfX = dx / 2;
-      halfZ = dz / 2;
+  // Border in the same yellow as the twin's workspace rectangle — it IS that
+  // rectangle, scaled up.
+  const border = [
+    [-halfW, -halfD], [halfW, -halfD], [halfW, halfD],
+    [-halfW, halfD], [-halfW, -halfD],
+  ].map(([x, z]) => new THREE.Vector3(x, 0.002, z));
+  group.add(new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(border),
+    new THREE.LineBasicMaterial({ color: 0xffd60a }),
+  ));
 
-      const panelGroup = new THREE.Group();
-      panelGroup.position.copy(center);
+  // Cursor dot: where the arm is being commanded, projected on the panel.
+  const cursor = new THREE.Mesh(
+    new THREE.SphereGeometry(0.011, 14, 10),
+    new THREE.MeshBasicMaterial({ color: 0xffffff }),
+  );
+  cursor.position.y = 0.006;
+  group.add(cursor);
 
-      const panel = new THREE.Mesh(
-        new THREE.PlaneGeometry(dx, dz),
-        new THREE.MeshBasicMaterial({
-          color: 0x38c0ff, transparent: true, opacity: 0.12,
-          side: THREE.DoubleSide, depthWrite: false,
-        }),
-      );
-      panel.rotation.x = -Math.PI / 2;
-      panelGroup.add(panel);
-
-      // Grid: 8 divisions each way, plus a brighter border.
-      const gpts = [];
-      const N = 8;
-      for (let i = 0; i <= N; i++) {
-        const fx = -halfX + (dx * i) / N;
-        const fz = -halfZ + (dz * i) / N;
-        gpts.push(new THREE.Vector3(fx, 0.001, -halfZ),
-                  new THREE.Vector3(fx, 0.001, halfZ));
-        gpts.push(new THREE.Vector3(-halfX, 0.001, fz),
-                  new THREE.Vector3(halfX, 0.001, fz));
-      }
-      panelGroup.add(new THREE.LineSegments(
-        new THREE.BufferGeometry().setFromPoints(gpts),
-        new THREE.LineBasicMaterial({
-          color: 0x38c0ff, transparent: true, opacity: 0.35,
-        }),
-      ));
-      const border = [
-        [-halfX, -halfZ], [halfX, -halfZ], [halfX, halfZ],
-        [-halfX, halfZ], [-halfX, -halfZ],
-      ].map(([x, z]) => new THREE.Vector3(x, 0.002, z));
-      panelGroup.add(new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints(border),
-        new THREE.LineBasicMaterial({ color: 0x38c0ff }),
-      ));
-
-      // Cursor dot: where the arm is being told to go, projected on the panel.
-      cursor = new THREE.Mesh(
-        new THREE.SphereGeometry(0.011, 14, 10),
-        new THREE.MeshBasicMaterial({ color: 0xffffff }),
-      );
-      cursor.position.y = 0.006;
-      panelGroup.add(cursor);
-
-      group.add(panelGroup);
-      areaVis = { group, cursor, halfX, halfZ, center };
-    }
-  }
-  if (!areaVis) areaVis = { group, cursor: null, halfX, halfZ, center };
   scene.add(group);
+  panel = { group, cursor, halfW, halfD };
 }
 
-function updateAreaCursor() {
-  if (!areaVis || !areaVis.cursor || !ema) return;
-  const px = Math.max(-areaVis.halfX, Math.min(areaVis.halfX, ema.x - areaVis.center.x));
-  const pz = Math.max(-areaVis.halfZ, Math.min(areaVis.halfZ, ema.z - areaVis.center.z));
-  areaVis.cursor.position.set(px, 0.006, pz);
-  areaVis.cursor.material.color.setHex(
+function movePanelTo(x, y, z) {
+  if (panel) panel.group.position.set(x, y, z);
+}
+
+function panelUV() {
+  if (!panel || !ema) return null;
+  const px = ema.x - panel.group.position.x;
+  const pz = ema.z - panel.group.position.z;
+  // u = depth fraction (near edge 0 → far edge 1), v = lateral (left 0 → right 1)
+  const u = clamp01((panel.halfD - pz) / (2 * panel.halfD));
+  const v = clamp01((px + panel.halfW) / (2 * panel.halfW));
+  return { u, v };
+}
+
+function updatePanelCursor() {
+  if (!panel || !panel.cursor || !ema) return;
+  const px = Math.max(-panel.halfW, Math.min(panel.halfW, ema.x - panel.group.position.x));
+  const pz = Math.max(-panel.halfD, Math.min(panel.halfD, ema.z - panel.group.position.z));
+  panel.cursor.position.set(px, 0.006, pz);
+  panel.cursor.material.color.setHex(
     paused ? 0x8e8e93 : penNow ? 0xff3b30 : 0xffffff);
 }
 
-// ── Calibration + pose streaming ────────────────────────────────────────────
-
-function calibratedUV() {
-  if (!cal.a || !cal.b || !ema) return null;
-  const dx = cal.b.x - cal.a.x;
-  const dz = cal.b.z - cal.a.z;
-  if (Math.abs(dx) < MIN_CAL_SIZE || Math.abs(dz) < MIN_CAL_SIZE) return null;
-  // u = depth (arm forward, serial field 1), v = lateral (serial field 2).
-  const u = clamp01((ema.z - cal.a.z) / dz);
-  const v = clamp01((ema.x - cal.a.x) / dx);
-  return { u, v };
-}
+// ── Pose streaming ───────────────────────────────────────────────────────────
 
 function clamp01(n) {
   return Math.max(0, Math.min(1, n));
@@ -432,14 +424,13 @@ function risingEdge(hand, idx, pressed) {
 }
 
 // Smooth the cursor, stream the pose.
-function updateRightCursor(x, z, penDown, time, y) {
-  if (y !== undefined) lastRightY = y;
+function updateRightCursor(x, z, penDown, time) {
   penNow = penDown;
   ema = ema
     ? { x: ema.x + EMA_ALPHA * (x - ema.x),
         z: ema.z + EMA_ALPHA * (z - ema.z) }
     : { x, z };
-  lastUV = calibratedUV();
+  lastUV = panelUV();
   if (time - lastSend >= SEND_INTERVAL_MS) {
     lastSend = time;
     const msg = {
@@ -452,13 +443,6 @@ function updateRightCursor(x, z, penDown, time, y) {
     if (lastUV && !paused) { msg.u = round4(lastUV.u); msg.v = round4(lastUV.v); }
     wsSend(msg);
   }
-}
-
-function setCorner(which) {
-  if (!ema) return;
-  cal[which] = { x: ema.x, z: ema.z, y: lastRightY };
-  wsSend({ t: 'cal', c: which, x: round3(ema.x), z: round3(ema.z) });
-  updateAreaVisuals();
 }
 
 // ── Frame loop ───────────────────────────────────────────────────────────────
@@ -491,10 +475,9 @@ function onFrame(time, frame) {
 
       if (hand === 'right') {
         rightSeen = true;
-        updateRightCursor(p.x, p.z, trigger, time, p.y);
-        if (risingEdge('right', 4, btn(4))) setCorner('a'); // A button
-        if (risingEdge('right', 5, btn(5))) setCorner('b'); // B button
-        if (risingEdge('right', 3, btn(3))) clearTrail();   // stick click
+        updateRightCursor(p.x, p.z, trigger, time);
+        if (risingEdge('right', 4, btn(4))) movePanelTo(p.x, p.y, p.z); // A
+        if (risingEdge('right', 3, btn(3))) clearTrail(); // stick click
       }
 
       if (hand === 'left') {
@@ -502,12 +485,18 @@ function onFrame(time, frame) {
         if (btn(1) && twin) { // grip held → carry the twin
           twin.group.position.set(p.x, p.y, p.z);
         }
+        // Thumbstick left/right rotates the twin to match the real robot.
+        const ax = gp.axes[2] || 0;
+        if (Math.abs(ax) > 0.5 && twin) {
+          twinYaw -= ax * 0.02; // ~80°/s at 72 fps
+          twin.group.rotation.y = twinYaw;
+        }
       }
     }
   }
 
   updateTwin();
-  updateAreaCursor();
+  updatePanelCursor();
 
   if (time - lastHudDraw > HUD_REDRAW_MS) {
     drawHud(buildHudModel(rightSeen));
@@ -537,26 +526,6 @@ function buildHudModel(rightSeen) {
   } else if (!rightSeen) {
     m.step = 'WAKE THE RIGHT CONTROLLER';
     m.lines = ['Press any button on it.'];
-  } else if (!cal.a) {
-    m.step = 'STEP 1 OF 2 — MARK CORNER A';
-    m.lines = [
-      'Hold the RIGHT controller at the NEAR-LEFT',
-      'corner of your drawing area, then press A.',
-    ];
-  } else if (!cal.b) {
-    m.step = 'STEP 2 OF 2 — MARK CORNER B';
-    m.lines = [
-      'Move to the FAR-RIGHT corner (further away',
-      'AND to the right), then press B.',
-      'The arm goes LIVE when you press B!',
-    ];
-  } else if (!lastUV) {
-    m.step = 'CORNERS TOO CLOSE — REDO';
-    m.lines = [
-      'The two corners must differ by 5 cm or more',
-      'both left-right and near-far.',
-      'Press A and B again at better spots.',
-    ];
   } else if (paused) {
     m.paused = true;
     m.step = 'PAUSED — ARM HOLDING';
@@ -565,8 +534,9 @@ function buildHudModel(rightSeen) {
     m.live = true;
     m.step = m.pen ? 'DRAWING' : 'LIVE — ARM FOLLOWS YOUR HAND';
     m.lines = [
-      'Stay inside the blue panel. Trigger = pen.',
-      'X: pause   A/B: redo corners   R-stick: clear trail',
+      'The blue panel is the robot’s drawing area.',
+      'Trigger = pen.  A: move panel to your hand.',
+      'X: pause   R-stick: clear trail',
     ];
   }
   return m;
@@ -624,7 +594,7 @@ function drawHud(m) {
   const foot = [];
   if (m.tm) foot.push(`arm q1 ${m.tm.q[0].toFixed(1)}°  q2 ${m.tm.q[1].toFixed(1)}°`);
   if (m.uv) foot.push(`pos ${(m.uv.v * 100).toFixed(0)}%,${(m.uv.u * 100).toFixed(0)}%`);
-  foot.push('L-grip: move twin');
+  foot.push('L-grip: move twin   L-stick: rotate twin');
   ctx.fillText(foot.join('    '), 48, H - 62);
 
   hudTexture.needsUpdate = true;

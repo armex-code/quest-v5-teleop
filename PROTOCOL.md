@@ -28,19 +28,16 @@ Sent at ~25 Hz while an AR session is active and the right controller is tracked
 |-----|-------|---------|
 | s   | int   | per-connection monotonically increasing sequence number. Host drops any frame with `s` ≤ last seen on that connection. |
 | x,z | float | raw right-controller position in Quest reference space, meters (EMA-smoothed on the Quest before sending) |
-| pen | 0/1   | trigger state (1 = pressed = pen down) |
-| u,v | float | calibrated workspace coords in [0,1]; **absent until both corners are set**. The host actuates only when present. `u` = depth axis (corner A → corner B along Quest Z), `v` = lateral axis (along Quest X). |
+| pen | 0/1   | trigger state (1 = pressed = pen down); forced 0 while paused (X button) |
+| u,v | float | position inside the fixed drawing panel, [0,1]. **Absent while paused** — the host actuates only when present. `u` = depth axis (near edge 0 → far edge 1), `v` = lateral axis (left 0 → right 1). The panel has the workspace's proportions (scaled) and is placed with the A button; no calibration. |
 | ts  | float | quest-local ms timestamp |
 
-### `cal` — calibration event
+The host applies `SWAP_UV` / `FLIP_U` / `FLIP_V` (constants in
+`server/run.py`) to each incoming `(u,v)` before forwarding, to match the
+robot's physical orientation.
 
-Informational; calibration math lives on the Quest. Sent when the user marks a
-corner (right-controller **A** = corner `a` = near-left, **B** = corner `b` =
-far-right).
-
-```json
-{"t":"cal","c":"a","x":0.021,"z":-0.334}
-```
+> The `cal` message from protocol v0.2 (2-corner calibration) was removed —
+> the panel is now fixed-proportion and needs no calibration.
 
 ## Host → Quest (WebSocket)
 
