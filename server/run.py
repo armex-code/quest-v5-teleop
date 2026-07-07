@@ -137,9 +137,14 @@ class Bridge:
                if p.vid == VEX_USB_VID]
         if not vex:
             return None
-        # The brain exposes two CDC ports; user programs talk on the "user"
-        # port. Prefer a port that says so, else take the last one (matches
-        # the old /dev/ttyACM1 convention).
+        # The brain exposes two CDC ports: USB interface 0 = admin (vexcom
+        # uploads), interface 2 = user (program stdio — the one we want).
+        # On Windows the user port's location string ends with ".2"; on Linux
+        # it's the second ttyACM. Fall back to "user" in the description,
+        # then to the last sorted port.
+        for p in vex:
+            if (p.location or "").endswith(".2"):
+                return p.device
         for p in vex:
             if "user" in (p.description or "").lower():
                 return p.device
