@@ -1,14 +1,13 @@
-// Quest → V5 teleop client (M1–M5 in one page).
+// Quest → V5 teleop client (controllers only).
 //
-// - immersive-ar passthrough session, HUD (in-scene canvas + dom-overlay)
-// - WebSocket to the host bridge (wss://<same-host>:8765), auto-reconnect
-// - 2-corner calibration: hold RIGHT controller at the NEAR-LEFT corner of the
-//   drawing area and press A, then at the FAR-RIGHT corner and press B.
-//   After that, poses stream as u,v ∈ [0,1] at 25 Hz and the arm follows.
-// - RIGHT trigger = pen down. LEFT grip (squeeze) = grab/move the twin.
-//   RIGHT thumbstick click = clear the pen trail.
-// - Digital twin: solid arm = encoder telemetry, translucent ghost = commanded
-//   angles, green trail = pen-down path of the solid tip.
+// Flow guided by the HUD, step by step:
+//   connect → wake right controller → mark corner A → mark corner B → LIVE.
+// Right controller = the pen: A/B mark the drawing-area corners, trigger =
+// pen down, thumbstick click = clear trail. Left grip = move the twin.
+//
+// Visuals: translucent gridded panel spanning the calibrated drawing area
+// with a live cursor dot (red while the pen is down), yellow corner markers,
+// and the digital twin (solid = encoders, ghost = commanded, green trail).
 import * as THREE from 'three';
 
 const startBtn = document.getElementById('start');
@@ -36,22 +35,25 @@ let cfg = { l1: 20.5, l2: 30.5, ws: [-10.5, 10.5, 18, 48] };
 
 // WebSocket state
 let ws = null;
-let wsStatus = 'connecting…';
-let serialStatus = '?';
+let wsStatus = 'connecting';
+let serialOk = false;
+let serialMsg = 'waiting for server…';
 let wsRetryMs = 1000;
 let seq = 0;
 let lastSend = 0;
 
 // Calibration + smoothing state
 const cal = { a: null, b: null };
-let ema = null; // smoothed {x, z} of the right controller
-let lastRightY = 1.0; // height of the right cursor (for the area visual)
+let ema = null;        // smoothed {x, z} of the right controller
+let lastRightY = 1.0;  // height of the right cursor (for the area visual)
 let lastUV = null;
 
-// Twin state
-let twin = null; // { group, solid:{shoulder,elbow,tip}, ghost:{...}, trail:{...} }
+// Scene objects
+let twin = null;
 let lastTm = null;
 let lastTipPos = null;
+let areaVis = null;    // { group, cursor, halfX, halfZ, center }
+let penNow = false;
 
 checkSupport();
 connectWS();
@@ -61,7 +63,7 @@ connectWS();
 function connectWS() {
   const url = `wss://${location.hostname}:${WS_PORT}`;
   ws = new WebSocket(url);
-  wsStatus = 'connecting…';
+  wsStatus = 'connecting';
 
   ws.onopen = () => {
     wsStatus = 'connected';
@@ -78,11 +80,13 @@ function connectWS() {
       cfg = { l1: msg.l1, l2: msg.l2, ws: msg.ws || cfg.ws };
       if (changed && twin) buildTwin();
     } else if (msg.t === 'st') {
-      serialStatus = msg.msg;
+      serialOk = !!msg.ok;
+      serialMsg = msg.msg;
     }
   };
   ws.onclose = () => {
-    wsStatus = `retry in ${(wsRetryMs / 1000).toFixed(0)}s`;
+    wsStatus = 'retrying';
+    serialOk = false;
     setTimeout(connectWS, wsRetryMs);
     wsRetryMs = Math.min(wsRetryMs + 1000, 5000);
   };
@@ -121,7 +125,7 @@ async function enterAR() {
   try {
     session = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['local-floor'],
-      optionalFeatures: ['dom-overlay', 'hand-tracking'],
+      optionalFeatures: ['dom-overlay'],
       domOverlay: { root: overlayRoot },
     });
   } catch (err) {
@@ -152,17 +156,17 @@ function initScene() {
   const light = new THREE.HemisphereLight(0xffffff, 0x445566, 2.4);
   scene.add(light);
 
-  // In-scene HUD: canvas texture on a plane 0.6 m in front of the camera.
+  // In-scene HUD: canvas texture on a plane 0.65 m in front of the camera.
   hudCanvas = document.createElement('canvas');
-  hudCanvas.width = 1024;
-  hudCanvas.height = 480;
+  hudCanvas.width = 1100;
+  hudCanvas.height = 560;
   hudCtx = hudCanvas.getContext('2d');
   hudTexture = new THREE.CanvasTexture(hudCanvas);
   const hudMesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(0.42, 0.197),
+    new THREE.PlaneGeometry(0.44, 0.224),
     new THREE.MeshBasicMaterial({ map: hudTexture, transparent: true }),
   );
-  hudMesh.position.set(0, -0.15, -0.6);
+  hudMesh.position.set(0, -0.16, -0.65);
   camera.add(hudMesh);
 
   // One sphere per controller; red while its trigger is held.
@@ -183,7 +187,6 @@ function initScene() {
 
 function makeArm(solid) {
   // Arm frame → twin local: arm-x → +x, arm-y → −z, joints rotate about +y.
-  // rotation.y = θ maps +X to (cosθ, 0, −sinθ), which is exactly arm (cosθ, sinθ).
   const S = TWIN_SCALE;
   const mat = (color) => new THREE.MeshStandardMaterial(
     solid
@@ -244,8 +247,7 @@ function buildTwin() {
   group.add(plate);
 
   // Workspace rectangle. cfg.ws is [lat_min, lat_max, fwd_min, fwd_max] in cm;
-  // in the V5's IK frame (the frame q1/q2 live in) forward is +x and lateral
-  // is +y, so build the rect as (fwd, lat) pairs.
+  // in the V5's IK frame forward is +x and lateral is +y.
   const [latMin, latMax, fwdMin, fwdMax] = cfg.ws;
   const rectPts = [
     [fwdMin, latMin], [fwdMax, latMin], [fwdMax, latMax],
@@ -311,8 +313,97 @@ function updateTwin() {
       lastTipPos = p;
     }
   } else {
-    lastTipPos = null; // next pen-down starts a fresh segment… visually close enough
+    lastTipPos = null;
   }
+}
+
+// ── Drawing-area visual: gridded panel + corner markers + cursor dot ───────
+
+function updateAreaVisuals() {
+  if (areaVis) { scene.remove(areaVis.group); areaVis = null; }
+
+  const group = new THREE.Group();
+  const cornerMat = new THREE.MeshBasicMaterial({ color: 0xffd60a });
+  for (const c of [cal.a, cal.b]) {
+    if (!c) continue;
+    const m = new THREE.Mesh(new THREE.SphereGeometry(0.014, 14, 10), cornerMat);
+    m.position.set(c.x, c.y ?? 1.0, c.z);
+    group.add(m);
+  }
+
+  let cursor = null, halfX = 0, halfZ = 0, center = null;
+  if (cal.a && cal.b) {
+    const dx = Math.abs(cal.b.x - cal.a.x);
+    const dz = Math.abs(cal.b.z - cal.a.z);
+    if (dx >= MIN_CAL_SIZE && dz >= MIN_CAL_SIZE) {
+      const cx = (cal.a.x + cal.b.x) / 2;
+      const cz = (cal.a.z + cal.b.z) / 2;
+      const cy = ((cal.a.y ?? 1.0) + (cal.b.y ?? 1.0)) / 2;
+      center = new THREE.Vector3(cx, cy, cz);
+      halfX = dx / 2;
+      halfZ = dz / 2;
+
+      const panelGroup = new THREE.Group();
+      panelGroup.position.copy(center);
+
+      const panel = new THREE.Mesh(
+        new THREE.PlaneGeometry(dx, dz),
+        new THREE.MeshBasicMaterial({
+          color: 0x38c0ff, transparent: true, opacity: 0.12,
+          side: THREE.DoubleSide, depthWrite: false,
+        }),
+      );
+      panel.rotation.x = -Math.PI / 2;
+      panelGroup.add(panel);
+
+      // Grid: 8 divisions each way, plus a brighter border.
+      const gpts = [];
+      const N = 8;
+      for (let i = 0; i <= N; i++) {
+        const fx = -halfX + (dx * i) / N;
+        const fz = -halfZ + (dz * i) / N;
+        gpts.push(new THREE.Vector3(fx, 0.001, -halfZ),
+                  new THREE.Vector3(fx, 0.001, halfZ));
+        gpts.push(new THREE.Vector3(-halfX, 0.001, fz),
+                  new THREE.Vector3(halfX, 0.001, fz));
+      }
+      panelGroup.add(new THREE.LineSegments(
+        new THREE.BufferGeometry().setFromPoints(gpts),
+        new THREE.LineBasicMaterial({
+          color: 0x38c0ff, transparent: true, opacity: 0.35,
+        }),
+      ));
+      const border = [
+        [-halfX, -halfZ], [halfX, -halfZ], [halfX, halfZ],
+        [-halfX, halfZ], [-halfX, -halfZ],
+      ].map(([x, z]) => new THREE.Vector3(x, 0.002, z));
+      panelGroup.add(new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints(border),
+        new THREE.LineBasicMaterial({ color: 0x38c0ff }),
+      ));
+
+      // Cursor dot: where the arm is being told to go, projected on the panel.
+      cursor = new THREE.Mesh(
+        new THREE.SphereGeometry(0.011, 14, 10),
+        new THREE.MeshBasicMaterial({ color: 0xffffff }),
+      );
+      cursor.position.y = 0.006;
+      panelGroup.add(cursor);
+
+      group.add(panelGroup);
+      areaVis = { group, cursor, halfX, halfZ, center };
+    }
+  }
+  if (!areaVis) areaVis = { group, cursor: null, halfX, halfZ, center };
+  scene.add(group);
+}
+
+function updateAreaCursor() {
+  if (!areaVis || !areaVis.cursor || !ema) return;
+  const px = Math.max(-areaVis.halfX, Math.min(areaVis.halfX, ema.x - areaVis.center.x));
+  const pz = Math.max(-areaVis.halfZ, Math.min(areaVis.halfZ, ema.z - areaVis.center.z));
+  areaVis.cursor.position.set(px, 0.006, pz);
+  areaVis.cursor.material.color.setHex(penNow ? 0xff3b30 : 0xffffff);
 }
 
 // ── Calibration + pose streaming ────────────────────────────────────────────
@@ -338,9 +429,10 @@ function risingEdge(hand, idx, pressed) {
   return pressed && !was;
 }
 
-// Shared by controller and hand input: smooth the cursor, stream the pose.
+// Smooth the cursor, stream the pose.
 function updateRightCursor(x, z, penDown, time, y) {
   if (y !== undefined) lastRightY = y;
+  penNow = penDown;
   ema = ema
     ? { x: ema.x + EMA_ALPHA * (x - ema.x),
         z: ema.z + EMA_ALPHA * (z - ema.z) }
@@ -363,207 +455,172 @@ function setCorner(which) {
   if (!ema) return;
   cal[which] = { x: ema.x, z: ema.z, y: lastRightY };
   wsSend({ t: 'cal', c: which, x: round3(ema.x), z: round3(ema.z) });
-  updateCalArea();
-}
-
-// ── Control-area visual: translucent panel spanning the calibrated rect ─────
-
-let calArea = null;
-
-function updateCalArea() {
-  if (calArea) { scene.remove(calArea); calArea = null; }
-  if (!cal.a || !cal.b) return;
-  const dx = Math.abs(cal.b.x - cal.a.x);
-  const dz = Math.abs(cal.b.z - cal.a.z);
-  if (dx < MIN_CAL_SIZE || dz < MIN_CAL_SIZE) return;
-
-  const cx = (cal.a.x + cal.b.x) / 2;
-  const cz = (cal.a.z + cal.b.z) / 2;
-  const cy = ((cal.a.y ?? 1.0) + (cal.b.y ?? 1.0)) / 2;
-
-  calArea = new THREE.Group();
-  const panel = new THREE.Mesh(
-    new THREE.PlaneGeometry(dx, dz),
-    new THREE.MeshBasicMaterial({
-      color: 0x38c0ff, transparent: true, opacity: 0.14,
-      side: THREE.DoubleSide, depthWrite: false,
-    }),
-  );
-  panel.rotation.x = -Math.PI / 2;
-  calArea.add(panel);
-  const border = [
-    [-dx / 2, -dz / 2], [dx / 2, -dz / 2], [dx / 2, dz / 2],
-    [-dx / 2, dz / 2], [-dx / 2, -dz / 2],
-  ].map(([x, z]) => new THREE.Vector3(x, 0.001, z));
-  calArea.add(new THREE.Line(
-    new THREE.BufferGeometry().setFromPoints(border),
-    new THREE.LineBasicMaterial({ color: 0x38c0ff }),
-  ));
-  calArea.position.set(cx, cy, cz);
-  scene.add(calArea);
-}
-
-// ── Hand-tracking input (controller-free fallback) ──────────────────────────
-// Right hand: index fingertip = cursor, thumb–index pinch = pen down.
-// Left hand pinches (thumb against a fingertip):
-//   index = corner A, middle = corner B, ring (hold) = move twin,
-//   pinky = clear trail.
-
-const PINCH_ON = 0.022;   // meters; hysteresis so the pen doesn't chatter
-const PINCH_OFF = 0.035;
-const pinchState = { left: {}, right: {} };
-
-function jointPos(frame, ref, xrHand, name) {
-  const joint = xrHand.get(name);
-  if (!joint) return null;
-  const pose = frame.getJointPose(joint, ref);
-  return pose ? pose.transform.position : null;
-}
-
-function pinchDetect(handedness, finger, thumbP, fingerP) {
-  const st = pinchState[handedness];
-  if (!thumbP || !fingerP) return { on: !!st[finger], edge: false };
-  const d = Math.hypot(thumbP.x - fingerP.x, thumbP.y - fingerP.y,
-                       thumbP.z - fingerP.z);
-  const on = st[finger] ? d < PINCH_OFF : d < PINCH_ON;
-  const edge = on && !st[finger];
-  st[finger] = on;
-  return { on, edge };
-}
-
-function processHand(src, handedness, frame, ref, time, lines) {
-  const h = src.hand;
-  const thumb = jointPos(frame, ref, h, 'thumb-tip');
-  const index = jointPos(frame, ref, h, 'index-finger-tip');
-  const tag = handedness === 'right' ? 'R✋' : 'L✋';
-  if (!index) {
-    lines.push(`${tag} tracking lost`);
-    return;
-  }
-  const pIndex = pinchDetect(handedness, 'index', thumb, index);
-
-  const marker = markers[handedness];
-  marker.position.set(index.x, index.y, index.z);
-  marker.visible = true;
-  marker.material.color.setHex(
-    pIndex.on ? 0xff3b30 : handedness === 'right' ? 0x34c759 : 0x3a86ff);
-
-  if (handedness === 'right') {
-    updateRightCursor(index.x, index.z, pIndex.on, time, index.y);
-    lines.push(`${tag} x ${fmt(index.x)}  z ${fmt(index.z)}   pen ${pIndex.on ? 'DOWN' : 'up'}`);
-  } else {
-    const pMiddle = pinchDetect('left', 'middle', thumb,
-      jointPos(frame, ref, h, 'middle-finger-tip'));
-    const pRing = pinchDetect('left', 'ring', thumb,
-      jointPos(frame, ref, h, 'ring-finger-tip'));
-    const pPinky = pinchDetect('left', 'pinky', thumb,
-      jointPos(frame, ref, h, 'pinky-finger-tip'));
-
-    if (pIndex.edge) setCorner('a');   // corner marked at the RIGHT cursor
-    if (pMiddle.edge) setCorner('b');
-    if (pRing.on && twin) twin.group.position.set(index.x, index.y, index.z);
-    if (pPinky.edge) clearTrail();
-  }
+  updateAreaVisuals();
 }
 
 // ── Frame loop ───────────────────────────────────────────────────────────────
 
 function onFrame(time, frame) {
-  const lines = [];
-  lines.push(`WS ${wsStatus}   V5: ${serialStatus}`);
+  let rightSeen = false;
 
   if (frame) {
     const ref = renderer.xr.getReferenceSpace();
     markers.left.visible = false;
     markers.right.visible = false;
 
-    let handMode = false;
     for (const src of frame.session.inputSources) {
       const hand = src.handedness;
       if (hand !== 'left' && hand !== 'right') continue;
-
-      if (src.hand) { // bare-hand tracking (no controller)
-        handMode = true;
-        processHand(src, hand, frame, ref, time, lines);
-        continue;
-      }
+      if (!src.gamepad) continue; // controllers only
 
       const gp = src.gamepad;
-      const btn = (i) => !!(gp && gp.buttons[i] && gp.buttons[i].pressed);
+      const btn = (i) => !!(gp.buttons[i] && gp.buttons[i].pressed);
       const trigger = btn(0);
       const pose = frame.getPose(src.targetRaySpace, ref);
+      if (!pose) continue;
 
-      if (pose) {
-        const p = pose.transform.position;
-        const marker = markers[hand];
-        marker.position.set(p.x, p.y, p.z);
-        marker.visible = true;
-        marker.material.color.setHex(
-          trigger ? 0xff3b30 : hand === 'right' ? 0x34c759 : 0x3a86ff);
+      const p = pose.transform.position;
+      const marker = markers[hand];
+      marker.position.set(p.x, p.y, p.z);
+      marker.visible = true;
+      marker.material.color.setHex(
+        trigger ? 0xff3b30 : hand === 'right' ? 0x34c759 : 0x3a86ff);
 
-        if (hand === 'right') {
-          updateRightCursor(p.x, p.z, trigger, time, p.y);
-          if (risingEdge('right', 4, btn(4))) setCorner('a'); // A button
-          if (risingEdge('right', 5, btn(5))) setCorner('b'); // B button
-          if (risingEdge('right', 3, btn(3))) clearTrail();   // stick click
-          lines.push(`R  x ${fmt(p.x)}  z ${fmt(p.z)}   pen ${trigger ? 'DOWN' : 'up'}`);
+      if (hand === 'right') {
+        rightSeen = true;
+        updateRightCursor(p.x, p.z, trigger, time, p.y);
+        if (risingEdge('right', 4, btn(4))) setCorner('a'); // A button
+        if (risingEdge('right', 5, btn(5))) setCorner('b'); // B button
+        if (risingEdge('right', 3, btn(3))) clearTrail();   // stick click
+      }
+
+      if (hand === 'left') {
+        if (btn(1) && twin) { // grip held → carry the twin
+          twin.group.position.set(p.x, p.y, p.z);
         }
-
-        if (hand === 'left') {
-          if (btn(1) && twin) { // grip held → carry the twin
-            twin.group.position.set(p.x, p.y, p.z);
-          }
-        }
-      } else {
-        lines.push(`${hand === 'right' ? 'R' : 'L'}  tracking lost`);
       }
     }
-
-    const markA = handMode ? 'L✋ index-pinch' : 'press A';
-    const markB = handMode ? 'L✋ middle-pinch' : 'press B';
-    if (!cal.a) {
-      lines.push(`CAL: hold R cursor at NEAR-LEFT corner, ${markA}`);
-    } else if (!cal.b) {
-      lines.push(`CAL: corner A set — R cursor at FAR-RIGHT corner, ${markB}`);
-    } else if (!lastUV) {
-      lines.push('CAL: corners too close — redo both (≥ 5 cm apart)');
-    } else {
-      lines.push(`CAL ok   u ${lastUV.u.toFixed(3)}  v ${lastUV.v.toFixed(3)}`);
-    }
-
-    lines.push(lastTm
-      ? `TWIN q1 ${lastTm.q[0].toFixed(1)}°  q2 ${lastTm.q[1].toFixed(1)}°`
-        + `   cmd ${lastTm.qc[0].toFixed(1)}° ${lastTm.qc[1].toFixed(1)}°`
-      : 'TWIN no telemetry yet');
-    lines.push(handMode
-      ? 'R pinch: pen | L pinch: index=A mid=B ring=move-twin pinky=clear'
-      : 'L-grip: move twin   R-stick click: clear trail');
   }
 
   updateTwin();
+  updateAreaCursor();
 
   if (time - lastHudDraw > HUD_REDRAW_MS) {
-    drawHud(lines);
+    drawHud(buildHudModel(rightSeen));
     lastHudDraw = time;
   }
   renderer.render(scene, camera);
 }
 
-// ── HUD / misc ───────────────────────────────────────────────────────────────
+// ── HUD ──────────────────────────────────────────────────────────────────────
 
-function drawHud(lines) {
+function buildHudModel(rightSeen) {
+  const m = {
+    wsOk: wsStatus === 'connected',
+    v5Ok: serialOk,
+    pen: penNow,
+    tm: lastTm,
+    uv: lastUV,
+  };
+
+  if (!m.wsOk) {
+    m.step = 'CONNECTING TO PC…';
+    m.lines = [
+      'If this never turns green:',
+      `visit https://${location.hostname}:${WS_PORT} once`,
+      'and accept the certificate, then reload.',
+    ];
+  } else if (!rightSeen) {
+    m.step = 'WAKE THE RIGHT CONTROLLER';
+    m.lines = ['Press any button on it.'];
+  } else if (!cal.a) {
+    m.step = 'STEP 1 OF 2 — MARK CORNER A';
+    m.lines = [
+      'Hold the RIGHT controller at the NEAR-LEFT',
+      'corner of your drawing area, then press A.',
+    ];
+  } else if (!cal.b) {
+    m.step = 'STEP 2 OF 2 — MARK CORNER B';
+    m.lines = [
+      'Move to the FAR-RIGHT corner (further away',
+      'AND to the right), then press B.',
+      'The arm goes LIVE when you press B!',
+    ];
+  } else if (!lastUV) {
+    m.step = 'CORNERS TOO CLOSE — REDO';
+    m.lines = [
+      'The two corners must differ by 5 cm or more',
+      'both left-right and near-far.',
+      'Press A and B again at better spots.',
+    ];
+  } else {
+    m.live = true;
+    m.step = m.pen ? 'DRAWING' : 'LIVE — ARM FOLLOWS YOUR HAND';
+    m.lines = [
+      'Stay inside the blue panel. Trigger = pen.',
+      'A/B: redo corners   R-stick: clear trail',
+    ];
+  }
+  return m;
+}
+
+function drawHud(m) {
   const ctx = hudCtx;
-  ctx.clearRect(0, 0, hudCanvas.width, hudCanvas.height);
-  ctx.fillStyle = 'rgba(10, 14, 18, 0.72)';
+  const W = hudCanvas.width, H = hudCanvas.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(10, 14, 18, 0.78)';
   ctx.beginPath();
-  ctx.roundRect(0, 0, hudCanvas.width, hudCanvas.height, 28);
+  ctx.roundRect(0, 0, W, H, 30);
   ctx.fill();
-  ctx.font = '40px ui-monospace, monospace';
-  ctx.fillStyle = '#e8edf2';
+
+  // Status chips
+  const chip = (x, label, ok, okText, badText) => {
+    ctx.beginPath();
+    ctx.arc(x, 52, 13, 0, Math.PI * 2);
+    ctx.fillStyle = ok ? '#34c759' : '#ff453a';
+    ctx.fill();
+    ctx.fillStyle = '#e8edf2';
+    ctx.font = '600 34px system-ui, sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`${label} ${ok ? okText : badText}`, x + 28, 54);
+  };
+  chip(48, 'PC', m.wsOk, 'connected', 'offline');
+  chip(430, 'ROBOT', m.v5Ok, 'connected', 'offline');
+  if (m.live) {
+    ctx.beginPath();
+    ctx.arc(830, 52, 13, 0, Math.PI * 2);
+    ctx.fillStyle = m.pen ? '#ff453a' : '#8e8e93';
+    ctx.fill();
+    ctx.fillStyle = '#e8edf2';
+    ctx.fillText(`PEN ${m.pen ? 'DOWN' : 'up'}`, 858, 54);
+  }
+
+  ctx.strokeStyle = 'rgba(232,237,242,0.18)';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(36, 96); ctx.lineTo(W - 36, 96); ctx.stroke();
+
+  // Step banner
+  ctx.fillStyle = m.live ? '#34c759' : '#38c0ff';
+  ctx.font = '800 56px system-ui, sans-serif';
   ctx.textBaseline = 'top';
-  lines.forEach((line, i) => ctx.fillText(line, 36, 28 + i * 54));
+  ctx.fillText(m.step, 48, 130);
+
+  // Instructions
+  ctx.fillStyle = '#e8edf2';
+  ctx.font = '400 40px system-ui, sans-serif';
+  (m.lines || []).forEach((line, i) => ctx.fillText(line, 48, 216 + i * 56));
+
+  // Telemetry footer
+  ctx.fillStyle = 'rgba(232,237,242,0.55)';
+  ctx.font = '400 30px ui-monospace, monospace';
+  const foot = [];
+  if (m.tm) foot.push(`arm q1 ${m.tm.q[0].toFixed(1)}°  q2 ${m.tm.q[1].toFixed(1)}°`);
+  if (m.uv) foot.push(`pos ${(m.uv.v * 100).toFixed(0)}%,${(m.uv.u * 100).toFixed(0)}%`);
+  foot.push('L-grip: move twin');
+  ctx.fillText(foot.join('    '), 48, H - 62);
+
   hudTexture.needsUpdate = true;
-  readoutEl.textContent = lines.join('\n');
+  readoutEl.textContent = `${m.step}\n${(m.lines || []).join('\n')}`;
 }
 
 function onSessionEnd() {
@@ -571,10 +628,6 @@ function onSessionEnd() {
   readoutEl.style.display = 'none';
   startBtn.disabled = false;
   setStatus('AR session ended. Tap Enter AR to restart.');
-}
-
-function fmt(n) {
-  return (n >= 0 ? '+' : '') + n.toFixed(3);
 }
 
 function round3(n) { return Math.round(n * 1000) / 1000; }
