@@ -85,8 +85,9 @@ Quest twin (ghost+solid) ◀──wss "tm" ◀── PC ◀──"E,q1,q2,c1,c2"
   (500 ms).
 - Messages: compact single-letter-keyed JSON, one per WebSocket text frame.
   Full schema in `PROTOCOL.md` (including the serial framing).
-- Quest page is plain ES modules + Three.js from CDN (pinned in the import map
-  in `quest/index.html`). No build step, ever.
+- Quest page is plain ES modules + Three.js vendored locally
+  (`quest/js/vendor/three.module.js`, v0.160.0, wired via the import map in
+  `quest/index.html`) so no internet is needed. No build step, ever.
 - `websockets` Python lib pinned `<13` (run.py uses the legacy
   `process_request` signature).
 

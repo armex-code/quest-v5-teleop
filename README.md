@@ -106,6 +106,6 @@ milestone tracker in `CLAUDE.md` and test in this order: page alone → WS
 (`--no-serial`) → V5 with the arm free to move safely → calibrated control →
 twin accuracy.
 
-No internet on the hotspot? The page pulls Three.js from a CDN — download
-`three.module.js` (v0.160.0) into `quest/js/vendor/` and point the import map
-in `quest/index.html` at it.
+The system needs **no internet at all**: Three.js (v0.160.0) is vendored at
+`quest/js/vendor/three.module.js`, so the hotspot only carries local
+Quest↔PC traffic.
