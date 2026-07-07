@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>V5 Arm Teleop — M1: controller readout</title>
+  <title>V5 Arm Teleop</title>
   <style>
     html, body { margin: 0; height: 100%; background: #101418; color: #e8edf2;
                  font-family: system-ui, sans-serif; }
@@ -27,9 +27,16 @@
 </head>
 <body>
   <div id="panel">
-    <h1>V5 Arm Teleop — Milestone 1</h1>
+    <h1>V5 Arm Teleop</h1>
     <button id="start" disabled>Enter AR</button>
     <p id="status">Checking WebXR support…</p>
+    <p style="max-width:34rem;opacity:.7;font-size:.9rem">
+      In AR: hold the <b>right controller</b> at the near-left corner of your
+      drawing area and press <b>A</b>, then at the far-right corner and press
+      <b>B</b>. After that the arm follows the controller; <b>trigger</b> = pen
+      down. <b>Left grip</b> grabs the digital twin, <b>right stick click</b>
+      clears the trail.
+    </p>
   </div>
   <div id="overlay"><div id="readout"></div></div>
   <script type="module" src="./js/app.js"></script>

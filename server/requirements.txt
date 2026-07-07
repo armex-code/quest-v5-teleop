@@ -1,0 +1,4 @@
+# websockets pinned <13: run.py uses the legacy process_request(path, headers)
+# signature, which changed in 13+.
+websockets>=12.0,<13
+pyserial>=3.5

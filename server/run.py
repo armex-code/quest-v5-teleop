@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""One-command host server for Quest -> V5 teleoperation.
+
+Runs three things in one process (host = the Windows PC, or a Pi — anything
+on the same network as the Quest with a USB cable to the V5 brain):
+
+  1. HTTPS static server for quest/           (default port 8443)
+  2. WSS WebSocket bridge for pose/telemetry  (default port 8765)
+  3. USB serial link to the VEX V5 brain      (auto-detected, 115200 baud)
+
+Data flow (see PROTOCOL.md):
+  Quest "p" msg (u,v,pen) --> serial "u,v,pen\\n" --> V5 (IK runs ON the brain)
+  V5 "E,q1,q2,c1,c2\\n"   --> WSS "tm" msg       --> Quest digital twin
+
+The server runs fine with no V5 attached (it keeps retrying every 2 s and
+tells the Quest via "st" messages) so the twin/UI can be tested standalone.
+
+Usage:
+    python server/run.py                # auto-detect serial, both servers
+    python server/run.py --serial COM5  # explicit serial port
+    python server/run.py --no-serial    # UI/twin testing without the V5
+"""
+import argparse
+import asyncio
+import http
+import json
+import ssl
+import sys
+import threading
+import time
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import serial
+import serial.tools.list_ports
+import websockets
+
+# Status lines must appear immediately even when output is piped/redirected.
+sys.stdout.reconfigure(line_buffering=True)
+
+SERVER_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SERVER_DIR.parent
+
+# Arm geometry — must match v5/main.py (the V5 owns the IK; these are only
+# echoed to the Quest so the digital twin matches the real arm).
+L1_CM = 20.5
+L2_CM = 30.5
+WORKSPACE = [-10.5, 10.5, 18.0, 48.0]  # arm-frame cm: x_min, x_max, y_min, y_max
+
+VEX_USB_VID = 0x2888          # VEX Robotics
+POSE_STALE_S = 0.5            # no fresh pose for this long -> force pen up
+SERIAL_TX_INTERVAL = 0.04     # 25 Hz max toward the V5
+
+
+class Bridge:
+    def __init__(self, serial_port=None, no_serial=False, verbose=False):
+        self.forced_port = serial_port
+        self.no_serial = no_serial
+        self.verbose = verbose
+        self.clients = set()
+        self.loop = None
+
+        self.ser = None
+        self.ser_lock = threading.Lock()
+
+        # Latest pose from the Quest (latest-wins; the pump drains it).
+        self.latest = None            # (u, v, pen)
+        self.latest_dirty = False
+        self.last_pose_time = 0.0
+        self.last_sent_pen = 0
+
+    # ── WebSocket side ────────────────────────────────────────────────────
+
+    async def ws_handler(self, ws):
+        peer = ws.remote_address
+        print(f"[ws] client connected: {peer}")
+        self.clients.add(ws)
+        last_seq = 0  # per-connection sequence space (reconnect = fresh)
+        try:
+            await ws.send(json.dumps({
+                "t": "cfg", "l1": L1_CM, "l2": L2_CM, "ws": WORKSPACE,
+            }))
+            await ws.send(self._status_msg())
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except ValueError:
+                    continue
+                mtype = msg.get("t")
+                if mtype == "p":
+                    s = msg.get("s", 0)
+                    if s <= last_seq:
+                        continue  # stale/out-of-order frame
+                    last_seq = s
+                    self._on_pose(msg)
+                elif mtype == "cal":
+                    print(f"[cal] corner {msg.get('c')} at "
+                          f"x={msg.get('x'):+.3f} z={msg.get('z'):+.3f}")
+        except websockets.ConnectionClosed:
+            pass
+        finally:
+            self.clients.discard(ws)
+            print(f"[ws] client disconnected: {peer}")
+
+    def _on_pose(self, msg):
+        self.last_pose_time = time.monotonic()
+        u, v = msg.get("u"), msg.get("v")
+        if u is None or v is None:
+            return  # uncalibrated — HUD-only, never actuate
+        pen = 1 if msg.get("pen") else 0
+        self.latest = (max(0.0, min(1.0, u)), max(0.0, min(1.0, v)), pen)
+        self.latest_dirty = True
+        if self.verbose:
+            print(f"[pose] u={u:.3f} v={v:.3f} pen={pen}")
+
+    def _status_msg(self):
+        if self.no_serial:
+            return json.dumps({"t": "st", "ok": 0, "msg": "serial disabled (--no-serial)"})
+        ok = 1 if self.ser else 0
+        msg = "V5 connected" if ok else "V5 not connected — retrying"
+        return json.dumps({"t": "st", "ok": ok, "msg": msg})
+
+    def broadcast(self, text):
+        websockets.broadcast(self.clients, text)
+
+    def broadcast_threadsafe(self, text):
+        if self.loop:
+            self.loop.call_soon_threadsafe(self.broadcast, text)
+
+    # ── Serial side ───────────────────────────────────────────────────────
+
+    def find_vex_port(self):
+        if self.forced_port:
+            return self.forced_port
+        vex = [p for p in serial.tools.list_ports.comports()
+               if p.vid == VEX_USB_VID]
+        if not vex:
+            return None
+        # The brain exposes two CDC ports; user programs talk on the "user"
+        # port. Prefer a port that says so, else take the last one (matches
+        # the old /dev/ttyACM1 convention).
+        for p in vex:
+            if "user" in (p.description or "").lower():
+                return p.device
+        return sorted(p.device for p in vex)[-1]
+
+    def serial_worker(self):
+        """Owns the serial connection: connects, reads telemetry, reconnects."""
+        while True:
+            port = self.find_vex_port()
+            if not port:
+                time.sleep(2.0)
+                continue
+            try:
+                ser = serial.Serial(port, baudrate=115200, timeout=1,
+                                    write_timeout=0.5)
+            except Exception as e:
+                print(f"[serial] open {port} failed: {e}")
+                time.sleep(2.0)
+                continue
+
+            print(f"[serial] connected to V5 on {port}")
+            with self.ser_lock:
+                self.ser = ser
+            self.broadcast_threadsafe(self._status_msg())
+
+            try:
+                while True:
+                    line = ser.readline().decode("ascii", "ignore").strip()
+                    if not line:
+                        continue
+                    if line.startswith("E,"):
+                        self._on_telemetry(line)
+                    elif self.verbose:
+                        print(f"[v5] {line}")
+            except Exception as e:
+                print(f"[serial] lost connection: {e}")
+            finally:
+                with self.ser_lock:
+                    self.ser = None
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                self.broadcast_threadsafe(self._status_msg())
+                time.sleep(2.0)
+
+    def _on_telemetry(self, line):
+        # "E,q1,q2,c1,c2" — measured and commanded arm-frame angles, degrees
+        parts = line.split(",")
+        if len(parts) != 5:
+            return
+        try:
+            q1, q2, c1, c2 = (float(x) for x in parts[1:])
+        except ValueError:
+            return
+        self.broadcast_threadsafe(json.dumps({
+            "t": "tm",
+            "q": [round(q1, 2), round(q2, 2)],
+            "qc": [round(c1, 2), round(c2, 2)],
+            "pen": self.last_sent_pen,
+            "ts": round(time.monotonic() * 1000, 1),
+        }))
+
+    def send_frame(self, u, v, pen):
+        with self.ser_lock:
+            ser = self.ser
+        if not ser:
+            return
+        try:
+            ser.write(f"{u:.6f},{v:.6f},{pen}\n".encode("ascii"))
+            self.last_sent_pen = pen
+        except Exception as e:
+            print(f"[serial] write failed: {e}")
+
+    # ── Pump: latest pose -> serial, plus stale-pose safety ──────────────
+
+    async def pump(self):
+        while True:
+            await asyncio.sleep(SERIAL_TX_INTERVAL)
+            if self.latest_dirty:
+                self.latest_dirty = False
+                self.send_frame(*self.latest)
+            elif (self.latest is not None and self.last_sent_pen
+                  and time.monotonic() - self.last_pose_time > POSE_STALE_S):
+                # Quest went quiet mid-stroke: hold position, raise the pen.
+                u, v, _ = self.latest
+                self.send_frame(u, v, 0)
+                print("[safety] pose stream stale — pen raised")
+
+
+def make_ssl_context(cert, key):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    return ctx
+
+
+def start_static_server(port, directory, cert, key):
+    handler = partial(SimpleHTTPRequestHandler, directory=directory)
+    httpd = ThreadingHTTPServer(("0.0.0.0", port), handler)
+    httpd.socket = make_ssl_context(cert, key).wrap_socket(
+        httpd.socket, server_side=True)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd
+
+
+async def health_check(path, request_headers):
+    """Answer plain HTTPS GETs on the WSS port so the Quest browser can
+    accept the self-signed cert for this port (docs/HTTPS_SETUP.md step 4)."""
+    if "Upgrade" not in request_headers:
+        return (http.HTTPStatus.OK,
+                [("Content-Type", "text/plain")],
+                b"WS bridge OK - cert accepted for this port. Go back to the app page.\n")
+    return None
+
+
+async def main_async(args):
+    bridge = Bridge(serial_port=args.serial, no_serial=args.no_serial,
+                    verbose=args.verbose)
+    bridge.loop = asyncio.get_running_loop()
+
+    if not args.no_serial:
+        threading.Thread(target=bridge.serial_worker, daemon=True).start()
+
+    ws_ssl = make_ssl_context(args.cert, args.key)
+    async with websockets.serve(bridge.ws_handler, "0.0.0.0", args.ws_port,
+                                ssl=ws_ssl, process_request=health_check):
+        print(f"[ws]   wss bridge on wss://0.0.0.0:{args.ws_port}")
+        await bridge.pump()  # runs forever
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--http-port", type=int, default=8443)
+    ap.add_argument("--ws-port", type=int, default=8765)
+    ap.add_argument("--dir", default=str(REPO_ROOT / "quest"))
+    ap.add_argument("--cert", default=str(SERVER_DIR / "certs" / "cert.pem"))
+    ap.add_argument("--key", default=str(SERVER_DIR / "certs" / "key.pem"))
+    ap.add_argument("--serial", default=None,
+                    help="serial port of the V5 user port (e.g. COM5); auto-detect if omitted")
+    ap.add_argument("--no-serial", action="store_true",
+                    help="run without the V5 (UI / twin testing)")
+    ap.add_argument("--no-static", action="store_true",
+                    help="don't serve quest/ (if another server does)")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+
+    for f in (args.cert, args.key):
+        if not Path(f).exists():
+            raise SystemExit(
+                f"missing {f} — run scripts/gen_cert.sh <THIS_PCS_LAN_IP> first "
+                "(Git Bash on Windows)")
+
+    if not args.no_static:
+        start_static_server(args.http_port, args.dir, args.cert, args.key)
+        print(f"[http] serving {args.dir}")
+        print(f"[http] open https://<THIS_PCS_LAN_IP>:{args.http_port} in the Quest Browser")
+
+    try:
+        asyncio.run(main_async(args))
+    except KeyboardInterrupt:
+        print("\n[exit] bye")
+
+
+if __name__ == "__main__":
+    main()

@@ -6,10 +6,12 @@ with a Three.js digital twin mirroring real encoder state back into the headset.
 ## READ THIS FIRST (every new session)
 
 1. Check **Milestone tracker** below — it is the single source of truth for
-   project state. Never work on a milestone past `CURRENT` without the user
-   explicitly confirming the current one **works on real hardware**.
-2. When a milestone is confirmed, update the tracker here AND regenerate
-   `HANDOFF.md` (a ready-to-paste continuation prompt for a smaller model).
+   project state. Everything is *built*; nothing is *hardware-confirmed* yet.
+   Do not build new features on top of unconfirmed ones without the user's
+   go-ahead; debugging what exists is always fine.
+2. When the user confirms something works on real hardware, update the tracker
+   here AND regenerate `HANDOFF.md` (a ready-to-paste continuation prompt for
+   a smaller model).
 3. Any change to message formats must be mirrored in `PROTOCOL.md` in the
    same commit/edit batch.
 4. If the user's message is a *new request* unrelated to the current milestone
@@ -18,83 +20,104 @@ with a Three.js digital twin mirroring real encoder state back into the headset.
 
 ## Milestone tracker
 
-> CURRENT: **Milestone 1 — built, awaiting hardware confirmation on Quest**
+> CURRENT: **all milestones built (2026-07-07) — awaiting first hardware test**
 
-- [x] M0 — Repo structure, CLAUDE.md, PROTOCOL.md draft, HTTPS cert flow
-- [ ] M1 — WebXR immersive-ar page shows controller X/Z + trigger state (built ✅ / hardware-confirmed ❌)
-- [ ] M2 — WebSocket streaming Quest → Pi script that prints poses
-- [ ] M3 — Pi-side IK + serial to V5 (integrate user's existing Python IK)
-- [ ] M4 — Calibration (2-corner), workspace clamp, EMA smoothing, pen control
-- [ ] M5 — Digital twin + telemetry return path (ghost = commanded, solid = encoders)
+- [x] M0 — Repo structure, CLAUDE.md, PROTOCOL.md, HTTPS cert flow
+- [ ] M1 — WebXR immersive-ar page, controller readout (built ✅ / confirmed ❌)
+- [ ] M2 — WebSocket streaming Quest → host (built ✅ / confirmed ❌)
+- [ ] M3 — Host → V5 serial; IK runs ON the V5 (built ✅ / confirmed ❌)
+- [ ] M4 — 2-corner calibration, EMA smoothing, pen flag (built ✅ / confirmed ❌)
+- [ ] M5 — Digital twin + telemetry return path (built ✅ / confirmed ❌)
 
-## Known unknowns — ASK THE USER when the milestone needs them
+Suggested first-test order: M1 page alone → WS connect (`--no-serial`) →
+serial with V5 on blocks (motors free) → calibrated control → twin accuracy.
 
-- `L1`, `L2` link lengths in cm (user wrote `[X]`/`[Y]` — placeholders). Needed by M3.
-- The user's **working Python IK code** for this arm. Ask them to paste it or
-  give a path at the start of M3. Do NOT rewrite IK from scratch; wrap theirs.
-- The Pi↔V5 serial protocol from their prior pygame project (port, baud,
-  message framing). Ask at M3.
-- Pi's LAN IP (needed for cert generation and Quest URL).
+## Key design facts (learned from the user's khatt-bot code — don't re-ask)
+
+- **The IK runs on the V5 brain**, not the host. `v5/main.py` (deploy with
+  VEXcode) contains the user's proven Jacobian IK, P velocity loop, gear ratio
+  (84/12), kill/reset bumper switches — copied from the user's khatt-bot
+  project (original lives in their khatt-bot GitHub repo; local copy deleted
+  2026-07-07 after absorbing it).
+- The host just forwards normalized coords over USB serial:
+  `"u,v,pen\n"` at ≤25 Hz, 115200 baud. Same wire format as the user's old
+  pygame project, so the old V5 program also still works (minus telemetry).
+- **L1 = 20.5 cm, L2 = 30.5 cm**, workspace lateral ±10.5 cm × depth 18–48 cm
+  (values from the V5 program; older files said 21.5/28 — if the twin looks
+  wrong, ask the user to re-measure).
+- Telemetry is the one V5-side addition: `"E,q1,q2,c1,c2\n"` at 20 Hz
+  (measured & commanded arm-frame degrees, gear ratio divided out).
+- Motors: shoulder PORT1 (36:1, reversed), elbow PORT4 (18:1). Pen servo was
+  on Pi GPIO in the old project; **no pen actuator currently** — the pen flag
+  is transported end-to-end but only stored on the V5.
 
 ## Hardware / network facts
 
 - Meta Quest 3S — Meta Quest Browser, WebXR `immersive-ar` (passthrough). HTTPS required.
-- Raspberry Pi on the same Wi-Fi as the Quest. Runs the HTTPS static server,
-  the WebSocket server, IK, and serial to the V5.
-- VEX V5 Brain over USB serial from the Pi. 2 smart motors (shoulder q1,
-  elbow q2), 1 actuator for pen up/down. Arm is horizontal planar.
+- **Host = the user's Windows 11 PC** (a Pi works identically, not needed).
+  Runs `server/run.py`: HTTPS static server (8443) + WSS bridge (8765) +
+  USB serial to the V5 (auto-detected by VEX vendor ID 0x2888, user port).
+- Network: campus Wi-Fi isolates clients → use the PC's **Mobile Hotspot**
+  (PC IP usually `192.168.137.1`); Quest connects to it. See docs/HTTPS_SETUP.md.
+- VEX V5 Brain over USB. 2 smart motors (shoulder q1, elbow q2 relative).
+  Arm is horizontal planar.
 
 ## Architecture
 
 ```
-Quest controller pose ──WebXR page (quest/)──wss──▶ Pi server (pi/) ──IK──serial──▶ V5 ──▶ motors
-Quest twin (ghost+solid) ◀──wss── telemetry ◀── Pi ◀── serial ◀── V5 encoder angles
+Quest controller ──WebXR page (quest/)──wss:8765──▶ PC server/run.py ──"u,v,pen"──serial──▶ V5 (IK + P-loop) ──▶ motors
+Quest twin (ghost+solid) ◀──wss "tm" ◀── PC ◀──"E,q1,q2,c1,c2"──serial ◀── V5 encoders
 ```
 
 ## Conventions (do not drift from these)
 
-- **Coordinates:** WebXR is y-up; the horizontal plane is X/Z. Quest sends raw
-  X/Z in **meters**. After calibration (M4) the Quest also sends normalized
-  workspace coords `u,v ∈ [0,1]`; the Pi maps those to arm-frame **cm** and
-  clamps to the reachable annulus (|L1−L2| < r < L1+L2).
-- **Angles:** degrees over the wire, floats, arm frame (q1 at shoulder, q2
-  relative to link 1).
-- **Rates:** Quest sends poses at ~25 Hz. Pi always acts on the **latest**
-  pose only — drop anything stale (compare `s` sequence numbers).
-- **Pen:** trigger pressed = pen down = `1`.
+- **Coordinates:** WebXR is y-up; the horizontal plane is X/Z. The Quest sends
+  raw X/Z in **meters** always, plus `u,v ∈ [0,1]` once calibrated (A button =
+  near-left corner, B = far-right; u = depth/Z axis, v = lateral/X axis).
+  The host forwards u,v verbatim; the V5's `normalized_to_workspace()` maps
+  them to arm cm and its workspace rectangle already sits inside the reachable
+  annulus — no host-side clamp needed.
+- **Angles:** degrees over the wire, arm frame (q1 at shoulder, q2 relative to
+  link 1), gear ratio divided out.
+- **Rates:** Quest sends ~25 Hz (EMA-smoothed on the Quest). Host acts on the
+  **latest** pose only (per-connection `s` sequence numbers). V5 telemetry 20 Hz.
+- **Pen:** trigger pressed = pen down = `1`. Host raises pen if poses go stale
+  (500 ms).
 - Messages: compact single-letter-keyed JSON, one per WebSocket text frame.
-  Full schema in `PROTOCOL.md`.
-- Quest page is plain ES modules + Three.js from CDN (pinned version in the
-  import map in `quest/index.html`). No build step, ever — the Quest loads it
-  straight from the Pi.
+  Full schema in `PROTOCOL.md` (including the serial framing).
+- Quest page is plain ES modules + Three.js from CDN (pinned in the import map
+  in `quest/index.html`). No build step, ever.
+- `websockets` Python lib pinned `<13` (run.py uses the legacy
+  `process_request` signature).
 
 ## Repo layout
 
 ```
 quest/            WebXR client (static, no build step)
   index.html      entry + import map + DOM overlay
-  js/app.js       AR session, controller polling, HUD (M1); WS + twin later
-pi/               everything that runs on the Raspberry Pi
-  serve_https.py  static HTTPS server for quest/ (WebXR needs secure context)
-  certs/          self-signed cert.pem/key.pem (gitignored) — see scripts/gen_cert.sh
+  js/app.js       AR session, HUD, WS client, calibration, digital twin
+server/           everything that runs on the host PC (was pi/)
+  run.py          ONE command: HTTPS static + WSS bridge + V5 serial
+  certs/          self-signed cert.pem/key.pem (gitignored) — scripts/gen_cert.sh
   requirements.txt
-scripts/gen_cert.sh   generate self-signed cert for the Pi's LAN IP
-docs/HTTPS_SETUP.md   cert flow + how to accept it on the Quest browser
-PROTOCOL.md       wire format (versioned draft; sections marked by milestone)
-HANDOFF.md        ready-to-paste prompt to continue this project on a smaller model
+v5/main.py        VEXcode V5 Python program (user's IK + telemetry) — deploy via VEXcode
+scripts/gen_cert.sh   self-signed cert for the host IP (run in Git Bash)
+docs/HTTPS_SETUP.md   hotspot + cert flow + Quest acceptance (both ports!)
+PROTOCOL.md       wire format: WS messages AND serial framing
+HANDOFF.md        ready-to-paste prompt to continue on a smaller model
 ```
 
-## How to run (current milestone, M1)
+## How to run
 
-On the Pi (or any machine on the same Wi-Fi):
 ```bash
-./scripts/gen_cert.sh <PI_LAN_IP>        # once, or when the IP changes
-python3 pi/serve_https.py                # serves quest/ at https://<PI_LAN_IP>:8443
+./scripts/gen_cert.sh 192.168.137.1      # once (Git Bash); hotspot IP
+pip install -r server/requirements.txt   # once
+python server/run.py                     # everything (add --no-serial to test without V5)
 ```
-On the Quest: open `https://<PI_LAN_IP>:8443` in the Quest Browser, accept the
-cert warning (Advanced → Proceed), tap **Enter AR**. Expected: passthrough with
-a floating HUD showing left/right controller X/Z and trigger state, and a small
-sphere on each controller that turns red while its trigger is held.
+Deploy `v5/main.py` to the brain from VEXcode and start it. On the Quest
+(connected to the PC hotspot): accept the cert at `https://<PC_IP>:8443` AND
+`https://<PC_IP>:8765`, then open the first URL → Enter AR → calibrate with
+A/B → draw. Full walkthrough in docs/HTTPS_SETUP.md.
 
 ## Usage-limit / model handoff rule
 
