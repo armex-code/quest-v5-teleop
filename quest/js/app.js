@@ -54,6 +54,7 @@ let lastTm = null;
 let lastTipPos = null;
 let areaVis = null;    // { group, cursor, halfX, halfZ, center }
 let penNow = false;
+let paused = false;    // X button: freeze the arm (server holds + raises pen)
 
 checkSupport();
 connectWS();
@@ -403,7 +404,8 @@ function updateAreaCursor() {
   const px = Math.max(-areaVis.halfX, Math.min(areaVis.halfX, ema.x - areaVis.center.x));
   const pz = Math.max(-areaVis.halfZ, Math.min(areaVis.halfZ, ema.z - areaVis.center.z));
   areaVis.cursor.position.set(px, 0.006, pz);
-  areaVis.cursor.material.color.setHex(penNow ? 0xff3b30 : 0xffffff);
+  areaVis.cursor.material.color.setHex(
+    paused ? 0x8e8e93 : penNow ? 0xff3b30 : 0xffffff);
 }
 
 // ── Calibration + pose streaming ────────────────────────────────────────────
@@ -443,10 +445,11 @@ function updateRightCursor(x, z, penDown, time, y) {
     const msg = {
       t: 'p', s: ++seq,
       x: round3(ema.x), z: round3(ema.z),
-      pen: penDown ? 1 : 0,
+      pen: penDown && !paused ? 1 : 0,
       ts: Math.round(time * 10) / 10,
     };
-    if (lastUV) { msg.u = round4(lastUV.u); msg.v = round4(lastUV.v); }
+    // While paused, u/v are withheld: the server holds position + raises pen.
+    if (lastUV && !paused) { msg.u = round4(lastUV.u); msg.v = round4(lastUV.v); }
     wsSend(msg);
   }
 }
@@ -495,6 +498,7 @@ function onFrame(time, frame) {
       }
 
       if (hand === 'left') {
+        if (risingEdge('left', 4, btn(4))) paused = !paused; // X → pause/resume
         if (btn(1) && twin) { // grip held → carry the twin
           twin.group.position.set(p.x, p.y, p.z);
         }
@@ -553,12 +557,16 @@ function buildHudModel(rightSeen) {
       'both left-right and near-far.',
       'Press A and B again at better spots.',
     ];
+  } else if (paused) {
+    m.paused = true;
+    m.step = 'PAUSED — ARM HOLDING';
+    m.lines = ['Press X (left controller) to resume.'];
   } else {
     m.live = true;
     m.step = m.pen ? 'DRAWING' : 'LIVE — ARM FOLLOWS YOUR HAND';
     m.lines = [
       'Stay inside the blue panel. Trigger = pen.',
-      'A/B: redo corners   R-stick: clear trail',
+      'X: pause   A/B: redo corners   R-stick: clear trail',
     ];
   }
   return m;
@@ -600,7 +608,7 @@ function drawHud(m) {
   ctx.beginPath(); ctx.moveTo(36, 96); ctx.lineTo(W - 36, 96); ctx.stroke();
 
   // Step banner
-  ctx.fillStyle = m.live ? '#34c759' : '#38c0ff';
+  ctx.fillStyle = m.live ? '#34c759' : m.paused ? '#ff9f0a' : '#38c0ff';
   ctx.font = '800 56px system-ui, sans-serif';
   ctx.textBaseline = 'top';
   ctx.fillText(m.step, 48, 130);

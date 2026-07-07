@@ -52,8 +52,11 @@ VEX_USB_VID = 0x2888          # VEX Robotics
 POSE_STALE_S = 0.5            # no fresh pose for this long -> force pen up
 SERIAL_TX_INTERVAL = 0.04     # 25 Hz max toward the V5
 
-# Direction mapping. Flip an axis here if the robot mirrors your hand.
-# u = depth (corner A -> B), v = lateral (corner A -> B).
+# Direction mapping, applied in this order to each incoming (u, v):
+#   1. SWAP_UV: transpose the axes (panel width was driving arm depth)
+#   2. FLIP_*: mirror an axis if the robot moves opposite to the hand
+# u = depth (corner A -> B), v = lateral (corner A -> B) as sent by the Quest.
+SWAP_UV = True
 FLIP_U = False
 FLIP_V = True
 
@@ -122,6 +125,8 @@ class Bridge:
         pen = 1 if msg.get("pen") else 0
         u = max(0.0, min(1.0, u))
         v = max(0.0, min(1.0, v))
+        if SWAP_UV:
+            u, v = v, u
         if FLIP_U:
             u = 1.0 - u
         if FLIP_V:

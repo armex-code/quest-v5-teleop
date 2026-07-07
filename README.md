@@ -66,8 +66,13 @@ Then: plug in the V5 and start its program → on the Quest open
 | Hold it at the **far-right** corner, press **B** | set corner B — arm is now live |
 | Move the right controller inside that rectangle | arm follows (25 Hz) |
 | **Right trigger** | pen down (flag is transported; no pen actuator fitted yet) |
+| **X** (left controller) | pause / resume teleop (arm holds position, pen up) |
 | **Left grip** (hold) | grab/reposition the digital twin |
 | **Right thumbstick click** | clear the pen trail on the twin |
+
+Orientation tuning lives at the top of `server/run.py` (`SWAP_UV`, `FLIP_U`,
+`FLIP_V`) and `quest/js/app.js` (`TWIN_Q_SIGN`) — one-line toggles if the arm
+ever moves transposed or mirrored relative to your hand.
 
 The in-headset HUD is a guided checklist: it shows PC/robot connection status
 and walks through the two calibration steps; once live, a gridded blue panel
