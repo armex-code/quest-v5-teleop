@@ -94,6 +94,7 @@ class Bridge:
         try:
             await ws.send(json.dumps({
                 "t": "cfg", "l1": L1_CM, "l2": L2_CM, "ws": WORKSPACE,
+                "swap": int(SWAP_UV),  # client transposes the panel to match
             }))
             await ws.send(self._status_msg())
             async for raw in ws:

@@ -45,9 +45,12 @@ robot's physical orientation.
 
 Lets the twin match the real arm without hardcoding. `ws` is the reachable
 workspace rectangle in arm cm: `[lat_min, lat_max, fwd_min, fwd_max]`.
+`swap` mirrors the server's `SWAP_UV` constant; when 1 the client builds the
+drawing panel transposed so its proportions stay true to what each hand axis
+drives.
 
 ```json
-{"t":"cfg","l1":20.5,"l2":30.5,"ws":[-10.5,10.5,18,48]}
+{"t":"cfg","l1":20.5,"l2":30.5,"ws":[-10.5,10.5,18,48],"swap":1}
 ```
 
 ### `tm` — telemetry

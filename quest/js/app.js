@@ -34,7 +34,9 @@ const markers = { left: null, right: null };
 const prevButtons = { left: {}, right: {} };
 
 // Arm geometry (cm) — defaults match v5/main.py; overwritten by "cfg" msg.
-let cfg = { l1: 20.5, l2: 30.5, ws: [-10.5, 10.5, 18, 48] };
+// swap=1: the server transposes u/v for the robot's physical orientation, so
+// the panel is built transposed too (its long axis = the workspace long axis).
+let cfg = { l1: 20.5, l2: 30.5, ws: [-10.5, 10.5, 18, 48], swap: 1 };
 
 // WebSocket state
 let ws = null;
@@ -57,6 +59,7 @@ let twinYaw = THREE.MathUtils.degToRad(TWIN_YAW_DEG);
 let lastTm = null;
 let lastTipPos = null;
 let panel = null;      // { group, cursor, halfW, halfD }
+const ctlCards = { left: null, right: null }; // floating button guides
 
 checkSupport();
 connectWS();
@@ -79,9 +82,10 @@ function connectWS() {
     if (msg.t === 'tm') {
       lastTm = msg;
     } else if (msg.t === 'cfg') {
-      const changed = msg.l1 !== cfg.l1 || msg.l2 !== cfg.l2
-        || JSON.stringify(msg.ws) !== JSON.stringify(cfg.ws);
-      cfg = { l1: msg.l1, l2: msg.l2, ws: msg.ws || cfg.ws };
+      const next = { l1: msg.l1, l2: msg.l2, ws: msg.ws || cfg.ws,
+                     swap: msg.swap ?? cfg.swap };
+      const changed = JSON.stringify(next) !== JSON.stringify(cfg);
+      cfg = next;
       if (changed && renderer) { buildTwin(); buildPanel(); }
     } else if (msg.t === 'st') {
       serialOk = !!msg.ok;
@@ -186,6 +190,64 @@ function initScene() {
 
   buildTwin();
   buildPanel();
+  ctlCards.left = makeCtlCard();
+  ctlCards.right = makeCtlCard();
+}
+
+// ── Controller button guides (floating cards, like VR game tooltips) ────────
+
+function makeCtlCard() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 640;
+  canvas.height = 340;
+  const tex = new THREE.CanvasTexture(canvas);
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, depthTest: false, transparent: true,
+  }));
+  sp.scale.set(0.15, 0.0797, 1);
+  sp.renderOrder = 10;
+  sp.visible = false;
+  scene.add(sp);
+  return { sp, canvas, ctx: canvas.getContext('2d'), tex, lastKey: '' };
+}
+
+// rows: [buttonName, action, isPressed]
+function drawCtlCard(card, title, rows) {
+  const key = title + rows.map((r) => r[2] ? 1 : 0).join('');
+  if (key === card.lastKey) return;
+  card.lastKey = key;
+
+  const ctx = card.ctx;
+  const W = card.canvas.width, H = card.canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(10, 14, 18, 0.82)';
+  ctx.beginPath();
+  ctx.roundRect(0, 0, W, H, 26);
+  ctx.fill();
+
+  ctx.fillStyle = 'rgba(232,237,242,0.6)';
+  ctx.font = '700 30px system-ui, sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(title, 30, 40);
+
+  rows.forEach(([name, action, on], i) => {
+    const y = 100 + i * 78;
+    // button chip
+    ctx.fillStyle = on ? '#34c759' : 'rgba(232,237,242,0.14)';
+    ctx.beginPath();
+    ctx.roundRect(30, y - 28, 210, 58, 14);
+    ctx.fill();
+    ctx.fillStyle = on ? '#0b100c' : '#e8edf2';
+    ctx.font = '700 32px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(name, 30 + 105, y + 2);
+    // action text
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#e8edf2';
+    ctx.font = '400 32px system-ui, sans-serif';
+    ctx.fillText(action, 268, y + 2);
+  });
+  card.tex.needsUpdate = true;
 }
 
 // ── Digital twin ─────────────────────────────────────────────────────────────
@@ -328,10 +390,15 @@ function buildPanel() {
   const old = panel;
   if (old) scene.remove(old.group);
 
-  // Workspace: lateral span → panel width (x), depth span → panel depth (z).
+  // Panel dimensions mirror what each hand axis actually drives on the arm.
+  // Without swap: width = lateral span, depth = forward span. With swap (the
+  // server transposes u/v), width drives the forward span and depth drives
+  // the lateral one — so the panel is transposed to keep proportions true.
   const [latMin, latMax, fwdMin, fwdMax] = cfg.ws;
-  const w = (latMax - latMin) / 100 * PANEL_SCALE; // cm → m, scaled
-  const d = (fwdMax - fwdMin) / 100 * PANEL_SCALE;
+  const latSpan = (latMax - latMin) / 100 * PANEL_SCALE; // cm → m, scaled
+  const fwdSpan = (fwdMax - fwdMin) / 100 * PANEL_SCALE;
+  const w = cfg.swap ? fwdSpan : latSpan;
+  const d = cfg.swap ? latSpan : fwdSpan;
   const halfW = w / 2, halfD = d / 2;
 
   const group = new THREE.Group();
@@ -454,6 +521,8 @@ function onFrame(time, frame) {
     const ref = renderer.xr.getReferenceSpace();
     markers.left.visible = false;
     markers.right.visible = false;
+    if (ctlCards.left) ctlCards.left.sp.visible = false;
+    if (ctlCards.right) ctlCards.right.sp.visible = false;
 
     for (const src of frame.session.inputSources) {
       const hand = src.handedness;
@@ -478,6 +547,17 @@ function onFrame(time, frame) {
         updateRightCursor(p.x, p.z, trigger, time);
         if (risingEdge('right', 4, btn(4))) movePanelTo(p.x, p.y, p.z); // A
         if (risingEdge('right', 3, btn(3))) clearTrail(); // stick click
+
+        const card = ctlCards.right;
+        if (card) {
+          card.sp.position.set(p.x, p.y + 0.11, p.z);
+          card.sp.visible = true;
+          drawCtlCard(card, 'RIGHT — the pen', [
+            ['Trigger', penNow ? 'pen DOWN' : 'pen down', trigger],
+            ['A', 'move panel here', btn(4)],
+            ['Stick press', 'clear trail', btn(3)],
+          ]);
+        }
       }
 
       if (hand === 'left') {
@@ -490,6 +570,17 @@ function onFrame(time, frame) {
         if (Math.abs(ax) > 0.5 && twin) {
           twinYaw -= ax * 0.02; // ~80°/s at 72 fps
           twin.group.rotation.y = twinYaw;
+        }
+
+        const card = ctlCards.left;
+        if (card) {
+          card.sp.position.set(p.x, p.y + 0.11, p.z);
+          card.sp.visible = true;
+          drawCtlCard(card, 'LEFT — the twin', [
+            ['X', paused ? 'resume' : 'pause', btn(4)],
+            ['Grip (hold)', 'move twin', btn(1)],
+            ['Stick ◄ ►', 'rotate twin', Math.abs(ax) > 0.5],
+          ]);
         }
       }
     }
