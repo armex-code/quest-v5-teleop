@@ -49,7 +49,9 @@ L2_CM = 30.5
 WORKSPACE = [-10.5, 10.5, 18.0, 48.0]  # arm-frame cm: x_min, x_max, y_min, y_max
 
 VEX_USB_VID = 0x2888          # VEX Robotics
-POSE_STALE_S = 0.5            # no fresh pose for this long -> force pen up
+# Casting/recording on the Quest steals Wi-Fi airtime and makes the pose
+# stream bursty; 1 s tolerates that while the slew limiter keeps motion safe.
+POSE_STALE_S = 1.0            # no fresh pose for this long -> force pen up
 SERIAL_TX_INTERVAL = 0.04     # 25 Hz max toward the V5
 
 # Direction mapping, applied in this order to each incoming (u, v):
