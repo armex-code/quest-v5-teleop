@@ -19,7 +19,8 @@ const overlayRoot = document.getElementById('overlay');
 const HUD_REDRAW_MS = 100;   // 10 Hz is plenty for text
 const WS_PORT = 8765;
 const SEND_INTERVAL_MS = 40; // 25 Hz pose stream
-const EMA_ALPHA = 0.35;      // pose smoothing (higher = snappier)
+const EMA_ALPHA = 0.18;      // pose smoothing (higher = snappier)
+const TWIN_Q_SIGN = -1;      // set to 1 if the twin mirrors the real arm
 const TWIN_SCALE = 0.006;    // meters per arm-cm → ~31 cm twin for a 51 cm arm
 const TRAIL_MAX = 4000;      // points
 const MIN_CAL_SIZE = 0.05;   // corners closer than 5 cm on an axis = invalid
@@ -44,6 +45,7 @@ let lastSend = 0;
 // Calibration + smoothing state
 const cal = { a: null, b: null };
 let ema = null; // smoothed {x, z} of the right controller
+let lastRightY = 1.0; // height of the right cursor (for the area visual)
 let lastUV = null;
 
 // Twin state
@@ -288,7 +290,7 @@ const _tipWorld = new THREE.Vector3();
 
 function updateTwin() {
   if (!twin || !lastTm) return;
-  const d2r = THREE.MathUtils.degToRad;
+  const d2r = (deg) => THREE.MathUtils.degToRad(deg) * TWIN_Q_SIGN;
   twin.solid.shoulder.rotation.y = d2r(lastTm.q[0]);
   twin.solid.elbow.rotation.y = d2r(lastTm.q[1]);
   twin.ghost.shoulder.rotation.y = d2r(lastTm.qc[0]);
@@ -337,7 +339,8 @@ function risingEdge(hand, idx, pressed) {
 }
 
 // Shared by controller and hand input: smooth the cursor, stream the pose.
-function updateRightCursor(x, z, penDown, time) {
+function updateRightCursor(x, z, penDown, time, y) {
+  if (y !== undefined) lastRightY = y;
   ema = ema
     ? { x: ema.x + EMA_ALPHA * (x - ema.x),
         z: ema.z + EMA_ALPHA * (z - ema.z) }
@@ -358,8 +361,46 @@ function updateRightCursor(x, z, penDown, time) {
 
 function setCorner(which) {
   if (!ema) return;
-  cal[which] = { x: ema.x, z: ema.z };
+  cal[which] = { x: ema.x, z: ema.z, y: lastRightY };
   wsSend({ t: 'cal', c: which, x: round3(ema.x), z: round3(ema.z) });
+  updateCalArea();
+}
+
+// ── Control-area visual: translucent panel spanning the calibrated rect ─────
+
+let calArea = null;
+
+function updateCalArea() {
+  if (calArea) { scene.remove(calArea); calArea = null; }
+  if (!cal.a || !cal.b) return;
+  const dx = Math.abs(cal.b.x - cal.a.x);
+  const dz = Math.abs(cal.b.z - cal.a.z);
+  if (dx < MIN_CAL_SIZE || dz < MIN_CAL_SIZE) return;
+
+  const cx = (cal.a.x + cal.b.x) / 2;
+  const cz = (cal.a.z + cal.b.z) / 2;
+  const cy = ((cal.a.y ?? 1.0) + (cal.b.y ?? 1.0)) / 2;
+
+  calArea = new THREE.Group();
+  const panel = new THREE.Mesh(
+    new THREE.PlaneGeometry(dx, dz),
+    new THREE.MeshBasicMaterial({
+      color: 0x38c0ff, transparent: true, opacity: 0.14,
+      side: THREE.DoubleSide, depthWrite: false,
+    }),
+  );
+  panel.rotation.x = -Math.PI / 2;
+  calArea.add(panel);
+  const border = [
+    [-dx / 2, -dz / 2], [dx / 2, -dz / 2], [dx / 2, dz / 2],
+    [-dx / 2, dz / 2], [-dx / 2, -dz / 2],
+  ].map(([x, z]) => new THREE.Vector3(x, 0.001, z));
+  calArea.add(new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(border),
+    new THREE.LineBasicMaterial({ color: 0x38c0ff }),
+  ));
+  calArea.position.set(cx, cy, cz);
+  scene.add(calArea);
 }
 
 // ── Hand-tracking input (controller-free fallback) ──────────────────────────
@@ -408,7 +449,7 @@ function processHand(src, handedness, frame, ref, time, lines) {
     pIndex.on ? 0xff3b30 : handedness === 'right' ? 0x34c759 : 0x3a86ff);
 
   if (handedness === 'right') {
-    updateRightCursor(index.x, index.z, pIndex.on, time);
+    updateRightCursor(index.x, index.z, pIndex.on, time, index.y);
     lines.push(`${tag} x ${fmt(index.x)}  z ${fmt(index.z)}   pen ${pIndex.on ? 'DOWN' : 'up'}`);
   } else {
     const pMiddle = pinchDetect('left', 'middle', thumb,
@@ -461,7 +502,7 @@ function onFrame(time, frame) {
           trigger ? 0xff3b30 : hand === 'right' ? 0x34c759 : 0x3a86ff);
 
         if (hand === 'right') {
-          updateRightCursor(p.x, p.z, trigger, time);
+          updateRightCursor(p.x, p.z, trigger, time, p.y);
           if (risingEdge('right', 4, btn(4))) setCorner('a'); // A button
           if (risingEdge('right', 5, btn(5))) setCorner('b'); // B button
           if (risingEdge('right', 3, btn(3))) clearTrail();   // stick click

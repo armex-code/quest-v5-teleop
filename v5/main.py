@@ -139,10 +139,12 @@ def normalized_to_workspace(x_norm, y_norm):
 target_angles = {"theta1": 0.0, "theta2": 0.0}
 pen_down = False
 
-MAX_VELOCITY = 70
-MIN_VELOCITY = 8
+# Toned down from the original 70/8/0.3 for teleop: hand tracking is noisier
+# than a mouse, so favor smoothness over speed.
+MAX_VELOCITY = 40
+MIN_VELOCITY = 5
 DEADBAND_DEG = 3.0
-KP = 0.3
+KP = 0.25
 
 def go_to(x, y):
     global global_angles

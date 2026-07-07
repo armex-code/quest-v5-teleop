@@ -52,6 +52,17 @@ VEX_USB_VID = 0x2888          # VEX Robotics
 POSE_STALE_S = 0.5            # no fresh pose for this long -> force pen up
 SERIAL_TX_INTERVAL = 0.04     # 25 Hz max toward the V5
 
+# Direction mapping. Flip an axis here if the robot mirrors your hand.
+# u = depth (corner A -> B), v = lateral (corner A -> B).
+FLIP_U = False
+FLIP_V = True
+
+# Output smoothing (the "buffer"): each 40 ms tick the commanded point eases
+# toward the target (EMA) and can move at most SLEW_PER_TICK of the workspace,
+# so hand jitter is absorbed and top speed is bounded (~1 s across the range).
+SMOOTH_ALPHA = 0.35
+SLEW_PER_TICK = 0.04
+
 
 class Bridge:
     def __init__(self, serial_port=None, no_serial=False, verbose=False):
@@ -66,9 +77,9 @@ class Bridge:
 
         # Latest pose from the Quest (latest-wins; the pump drains it).
         self.latest = None            # (u, v, pen)
-        self.latest_dirty = False
         self.last_pose_time = 0.0
         self.last_sent_pen = 0
+        self.stale_notified = False
 
     # ── WebSocket side ────────────────────────────────────────────────────
 
@@ -109,8 +120,13 @@ class Bridge:
         if u is None or v is None:
             return  # uncalibrated — HUD-only, never actuate
         pen = 1 if msg.get("pen") else 0
-        self.latest = (max(0.0, min(1.0, u)), max(0.0, min(1.0, v)), pen)
-        self.latest_dirty = True
+        u = max(0.0, min(1.0, u))
+        v = max(0.0, min(1.0, v))
+        if FLIP_U:
+            u = 1.0 - u
+        if FLIP_V:
+            v = 1.0 - v
+        self.latest = (u, v, pen)
         if self.verbose:
             print(f"[pose] u={u:.3f} v={v:.3f} pen={pen}")
 
@@ -219,20 +235,38 @@ class Bridge:
         except Exception as e:
             print(f"[serial] write failed: {e}")
 
-    # ── Pump: latest pose -> serial, plus stale-pose safety ──────────────
+    # ── Pump: smooth latest pose -> serial, plus stale-pose safety ───────
 
     async def pump(self):
+        su = sv = None          # smoothed command actually sent to the arm
+        lu = lv = None          # last values written to serial
         while True:
             await asyncio.sleep(SERIAL_TX_INTERVAL)
-            if self.latest_dirty:
-                self.latest_dirty = False
-                self.send_frame(*self.latest)
-            elif (self.latest is not None and self.last_sent_pen
-                  and time.monotonic() - self.last_pose_time > POSE_STALE_S):
-                # Quest went quiet mid-stroke: hold position, raise the pen.
-                u, v, _ = self.latest
-                self.send_frame(u, v, 0)
-                print("[safety] pose stream stale — pen raised")
+            if self.latest is None:
+                continue
+            u, v, pen = self.latest
+
+            stale = time.monotonic() - self.last_pose_time > POSE_STALE_S
+            if stale:
+                pen = 0  # hold position, raise pen
+                if not self.stale_notified:
+                    self.stale_notified = True
+                    print("[safety] pose stream stale — pen raised")
+            else:
+                self.stale_notified = False
+
+            if su is None:
+                su, sv = u, v
+            else:
+                du = max(-SLEW_PER_TICK, min(SLEW_PER_TICK, SMOOTH_ALPHA * (u - su)))
+                dv = max(-SLEW_PER_TICK, min(SLEW_PER_TICK, SMOOTH_ALPHA * (v - sv)))
+                su += du
+                sv += dv
+
+            moved = (lu is None or abs(su - lu) > 1e-4 or abs(sv - lv) > 1e-4)
+            if moved or pen != self.last_sent_pen:
+                self.send_frame(su, sv, pen)
+                lu, lv = su, sv
 
 
 def make_ssl_context(cert, key):
