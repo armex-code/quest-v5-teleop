@@ -69,6 +69,13 @@ Then: plug in the V5 and start its program → on the Quest open
 | **Left grip** (hold) | grab/reposition the digital twin |
 | **Right thumbstick click** | clear the pen trail on the twin |
 
+**Controller-free (bare hands):** hand tracking works too — the right **index
+fingertip** is the cursor and a right **thumb–index pinch** = pen down.
+Left-hand pinches replace the buttons: **index** = corner A, **middle** =
+corner B, **ring** (hold) = move the twin, **pinky** = clear the trail.
+(Quest Settings → Movement tracking → Hand tracking must be on; put the
+controllers down or let them sleep and your hands appear automatically.)
+
 The HUD shows WebSocket/V5 connection state, calibration status, live `u,v`,
 and the twin's current encoder angles. The physical kill switch (bumper A) and
 reset switch (bumper B) on the robot still work exactly as in the old project.

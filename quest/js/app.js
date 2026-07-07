@@ -119,7 +119,7 @@ async function enterAR() {
   try {
     session = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['local-floor'],
-      optionalFeatures: ['dom-overlay'],
+      optionalFeatures: ['dom-overlay', 'hand-tracking'],
       domOverlay: { root: overlayRoot },
     });
   } catch (err) {
@@ -336,6 +336,95 @@ function risingEdge(hand, idx, pressed) {
   return pressed && !was;
 }
 
+// Shared by controller and hand input: smooth the cursor, stream the pose.
+function updateRightCursor(x, z, penDown, time) {
+  ema = ema
+    ? { x: ema.x + EMA_ALPHA * (x - ema.x),
+        z: ema.z + EMA_ALPHA * (z - ema.z) }
+    : { x, z };
+  lastUV = calibratedUV();
+  if (time - lastSend >= SEND_INTERVAL_MS) {
+    lastSend = time;
+    const msg = {
+      t: 'p', s: ++seq,
+      x: round3(ema.x), z: round3(ema.z),
+      pen: penDown ? 1 : 0,
+      ts: Math.round(time * 10) / 10,
+    };
+    if (lastUV) { msg.u = round4(lastUV.u); msg.v = round4(lastUV.v); }
+    wsSend(msg);
+  }
+}
+
+function setCorner(which) {
+  if (!ema) return;
+  cal[which] = { x: ema.x, z: ema.z };
+  wsSend({ t: 'cal', c: which, x: round3(ema.x), z: round3(ema.z) });
+}
+
+// ── Hand-tracking input (controller-free fallback) ──────────────────────────
+// Right hand: index fingertip = cursor, thumb–index pinch = pen down.
+// Left hand pinches (thumb against a fingertip):
+//   index = corner A, middle = corner B, ring (hold) = move twin,
+//   pinky = clear trail.
+
+const PINCH_ON = 0.022;   // meters; hysteresis so the pen doesn't chatter
+const PINCH_OFF = 0.035;
+const pinchState = { left: {}, right: {} };
+
+function jointPos(frame, ref, xrHand, name) {
+  const joint = xrHand.get(name);
+  if (!joint) return null;
+  const pose = frame.getJointPose(joint, ref);
+  return pose ? pose.transform.position : null;
+}
+
+function pinchDetect(handedness, finger, thumbP, fingerP) {
+  const st = pinchState[handedness];
+  if (!thumbP || !fingerP) return { on: !!st[finger], edge: false };
+  const d = Math.hypot(thumbP.x - fingerP.x, thumbP.y - fingerP.y,
+                       thumbP.z - fingerP.z);
+  const on = st[finger] ? d < PINCH_OFF : d < PINCH_ON;
+  const edge = on && !st[finger];
+  st[finger] = on;
+  return { on, edge };
+}
+
+function processHand(src, handedness, frame, ref, time, lines) {
+  const h = src.hand;
+  const thumb = jointPos(frame, ref, h, 'thumb-tip');
+  const index = jointPos(frame, ref, h, 'index-finger-tip');
+  const tag = handedness === 'right' ? 'R✋' : 'L✋';
+  if (!index) {
+    lines.push(`${tag} tracking lost`);
+    return;
+  }
+  const pIndex = pinchDetect(handedness, 'index', thumb, index);
+
+  const marker = markers[handedness];
+  marker.position.set(index.x, index.y, index.z);
+  marker.visible = true;
+  marker.material.color.setHex(
+    pIndex.on ? 0xff3b30 : handedness === 'right' ? 0x34c759 : 0x3a86ff);
+
+  if (handedness === 'right') {
+    updateRightCursor(index.x, index.z, pIndex.on, time);
+    lines.push(`${tag} x ${fmt(index.x)}  z ${fmt(index.z)}   pen ${pIndex.on ? 'DOWN' : 'up'}`);
+  } else {
+    const pMiddle = pinchDetect('left', 'middle', thumb,
+      jointPos(frame, ref, h, 'middle-finger-tip'));
+    const pRing = pinchDetect('left', 'ring', thumb,
+      jointPos(frame, ref, h, 'ring-finger-tip'));
+    const pPinky = pinchDetect('left', 'pinky', thumb,
+      jointPos(frame, ref, h, 'pinky-finger-tip'));
+
+    if (pIndex.edge) setCorner('a');   // corner marked at the RIGHT cursor
+    if (pMiddle.edge) setCorner('b');
+    if (pRing.on && twin) twin.group.position.set(index.x, index.y, index.z);
+    if (pPinky.edge) clearTrail();
+  }
+}
+
 // ── Frame loop ───────────────────────────────────────────────────────────────
 
 function onFrame(time, frame) {
@@ -347,9 +436,16 @@ function onFrame(time, frame) {
     markers.left.visible = false;
     markers.right.visible = false;
 
+    let handMode = false;
     for (const src of frame.session.inputSources) {
       const hand = src.handedness;
       if (hand !== 'left' && hand !== 'right') continue;
+
+      if (src.hand) { // bare-hand tracking (no controller)
+        handMode = true;
+        processHand(src, hand, frame, ref, time, lines);
+        continue;
+      }
 
       const gp = src.gamepad;
       const btn = (i) => !!(gp && gp.buttons[i] && gp.buttons[i].pressed);
@@ -365,55 +461,31 @@ function onFrame(time, frame) {
           trigger ? 0xff3b30 : hand === 'right' ? 0x34c759 : 0x3a86ff);
 
         if (hand === 'right') {
-          // Smooth on the Quest, before sending (PROTOCOL.md).
-          ema = ema
-            ? { x: ema.x + EMA_ALPHA * (p.x - ema.x),
-                z: ema.z + EMA_ALPHA * (p.z - ema.z) }
-            : { x: p.x, z: p.z };
-
-          if (risingEdge('right', 4, btn(4))) { // A → corner A
-            cal.a = { x: ema.x, z: ema.z };
-            wsSend({ t: 'cal', c: 'a', x: round3(ema.x), z: round3(ema.z) });
-          }
-          if (risingEdge('right', 5, btn(5))) { // B → corner B
-            cal.b = { x: ema.x, z: ema.z };
-            wsSend({ t: 'cal', c: 'b', x: round3(ema.x), z: round3(ema.z) });
-          }
-          if (risingEdge('right', 3, btn(3))) clearTrail(); // stick click
-
-          lastUV = calibratedUV();
-          if (time - lastSend >= SEND_INTERVAL_MS) {
-            lastSend = time;
-            const msg = {
-              t: 'p', s: ++seq,
-              x: round3(ema.x), z: round3(ema.z),
-              pen: trigger ? 1 : 0,
-              ts: Math.round(time * 10) / 10,
-            };
-            if (lastUV) { msg.u = round4(lastUV.u); msg.v = round4(lastUV.v); }
-            wsSend(msg);
-          }
-
+          updateRightCursor(p.x, p.z, trigger, time);
+          if (risingEdge('right', 4, btn(4))) setCorner('a'); // A button
+          if (risingEdge('right', 5, btn(5))) setCorner('b'); // B button
+          if (risingEdge('right', 3, btn(3))) clearTrail();   // stick click
           lines.push(`R  x ${fmt(p.x)}  z ${fmt(p.z)}   pen ${trigger ? 'DOWN' : 'up'}`);
         }
 
         if (hand === 'left') {
-          if (btn(1)) { // grip held → carry the twin
-            if (twin) twin.group.position.set(p.x, p.y, p.z);
+          if (btn(1) && twin) { // grip held → carry the twin
+            twin.group.position.set(p.x, p.y, p.z);
           }
-          if (risingEdge('left', 1, btn(1))) { /* edge tracked for HUD only */ }
         }
       } else {
         lines.push(`${hand === 'right' ? 'R' : 'L'}  tracking lost`);
       }
     }
 
+    const markA = handMode ? 'L✋ index-pinch' : 'press A';
+    const markB = handMode ? 'L✋ middle-pinch' : 'press B';
     if (!cal.a) {
-      lines.push('CAL: hold R at NEAR-LEFT corner, press A');
+      lines.push(`CAL: hold R cursor at NEAR-LEFT corner, ${markA}`);
     } else if (!cal.b) {
-      lines.push('CAL: corner A set — hold R at FAR-RIGHT corner, press B');
+      lines.push(`CAL: corner A set — R cursor at FAR-RIGHT corner, ${markB}`);
     } else if (!lastUV) {
-      lines.push('CAL: corners too close — redo A and B (≥ 5 cm apart)');
+      lines.push('CAL: corners too close — redo both (≥ 5 cm apart)');
     } else {
       lines.push(`CAL ok   u ${lastUV.u.toFixed(3)}  v ${lastUV.v.toFixed(3)}`);
     }
@@ -422,7 +494,9 @@ function onFrame(time, frame) {
       ? `TWIN q1 ${lastTm.q[0].toFixed(1)}°  q2 ${lastTm.q[1].toFixed(1)}°`
         + `   cmd ${lastTm.qc[0].toFixed(1)}° ${lastTm.qc[1].toFixed(1)}°`
       : 'TWIN no telemetry yet');
-    lines.push('L-grip: move twin   R-stick click: clear trail');
+    lines.push(handMode
+      ? 'R pinch: pen | L pinch: index=A mid=B ring=move-twin pinky=clear'
+      : 'L-grip: move twin   R-stick click: clear trail');
   }
 
   updateTwin();
