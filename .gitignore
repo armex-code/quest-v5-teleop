@@ -12,3 +12,6 @@ bin/mediamtx.yml
 server/auto.crt
 server/auto.key
 server/mediamtx.log
+
+# Hash of the last v5/main.py uploaded to the brain (per machine).
+.v5_deployed

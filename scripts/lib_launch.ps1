@@ -45,6 +45,97 @@ function Get-HostIp {
   return '127.0.0.1'
 }
 
+$script:FW_RULES = @(
+  @{ Name = 'Teleop page (TCP 8443)';      Proto = 'TCP'; Port = 8443 },
+  @{ Name = 'Teleop WS bridge (TCP 8765)'; Proto = 'TCP'; Port = 8765 },
+  # UDP 8189 carries the 360 video straight to the headset, bypassing the web
+  # server. Forgetting it is THE classic failure: the page loads perfectly and
+  # the world stays black forever.
+  @{ Name = 'Teleop 360 media (UDP 8189)'; Proto = 'UDP'; Port = 8189 }
+)
+
+<#
+Make sure our inbound rules exist, elevating only if some are missing.
+
+Reading the rules needs no privileges, so the normal case (already set up) is
+silent and non-elevated. Only the very first run raises a UAC prompt, and it
+runs a throwaway script that does nothing but add the rules.
+#>
+function Confirm-FirewallRules {
+  $missing = $script:FW_RULES | Where-Object {
+    -not (Get-NetFirewallRule -DisplayName $_.Name -ErrorAction SilentlyContinue)
+  }
+  if (-not $missing) { return $true }
+
+  Say ''
+  Say '  Firewall rules are missing. Windows will ask for administrator once;' 'Yellow'
+  Say '  after that this never prompts again:' 'Yellow'
+  foreach ($r in $missing) { Say ("    " + $r.Name) 'DarkGray' }
+
+  # Via a temp script rather than -Command: the rule names contain spaces and
+  # parentheses, and quoting them through Start-Process is a losing game.
+  $lines = $missing | ForEach-Object {
+    "New-NetFirewallRule -DisplayName '$($_.Name)' -Direction Inbound " +
+    "-Action Allow -Protocol $($_.Proto) -LocalPort $($_.Port) -Profile Any | Out-Null"
+  }
+  $tmp = Join-Path $env:TEMP 'teleop_firewall.ps1'
+  Set-Content -Path $tmp -Value ($lines -join "`r`n") -Encoding ASCII
+
+  try {
+    Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden `
+      -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File', "`"$tmp`"")
+  } catch {
+    Say '  UAC declined. Continuing without the rules -- the page will load but' 'Red'
+    Say '  the 360 view will stay black until UDP 8189 is allowed.' 'Red'
+    return $false
+  } finally {
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+  }
+
+  $still = $script:FW_RULES | Where-Object {
+    -not (Get-NetFirewallRule -DisplayName $_.Name -ErrorAction SilentlyContinue)
+  }
+  if ($still) { Say '  Some rules still missing; 360 video may not reach the headset.' 'Red'; return $false }
+  Say '  Firewall rules added.' 'Green'
+  return $true
+}
+
+<#
+Upload v5/main.py to the brain, but only when it has actually changed.
+
+Re-flashing on every launch would be wasteful and slow, so the SHA of the
+last uploaded file is stamped next to the repo and compared. Returns one of
+'skipped' | 'uploaded' | 'unchanged' | 'failed' so the caller can report it.
+#>
+function Sync-V5Program([string] $root, [int] $slot = 3) {
+  $src = Join-Path $root 'v5\main.py'
+  if (-not (Test-Path $src)) { return 'skipped' }
+
+  $admin = Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object {
+    $_.Name -match 'COM(\d+)' -and $_.PNPDeviceID -match 'VID_2888' -and
+    $_.PNPDeviceID -match 'MI_00'
+  } | Select-Object -First 1
+  if (-not $admin -or $admin.Name -notmatch 'COM(\d+)') { return 'skipped' }
+  $port = 'COM' + $Matches[1]
+
+  $vexcom = Find-Vexcom
+  if (-not $vexcom) { return 'skipped' }
+
+  $hash  = (Get-FileHash $src -Algorithm SHA256).Hash
+  $stamp = Join-Path $root '.v5_deployed'
+  if ((Test-Path $stamp) -and (Get-Content $stamp -Raw).Trim() -eq "$slot`:$hash") {
+    return 'unchanged'
+  }
+
+  # The brain shows the uploaded filename as the program name.
+  $staged = Join-Path $env:TEMP 'qteleop.py'
+  Copy-Item $src $staged -Force
+  & $vexcom --slot $slot --write $staged $port | Out-Null
+  if ($LASTEXITCODE -ne 0) { return 'failed' }
+  Set-Content -Path $stamp -Value "$slot`:$hash" -Encoding ASCII
+  return 'uploaded'
+}
+
 function Find-Vexcom {
   $root = Join-Path $env:APPDATA 'Code\User\globalStorage\vexrobotics.vexcode\tools\vexcom'
   if (-not (Test-Path $root)) { return $null }

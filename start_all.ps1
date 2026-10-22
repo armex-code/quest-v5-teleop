@@ -1,20 +1,24 @@
 <#
 .SYNOPSIS
-  Start the whole rig in one command: web page + WS bridge + V5 serial, plus
-  the 360 camera.
+  THE command. Everything the rig needs, in one go.
 
 .DESCRIPTION
-  Launches three processes and ties their lifetimes together, so Ctrl+C stops
+  Does the one-time chores (only when they are actually outstanding), then
+  launches three processes and ties their lifetimes together, so Ctrl+C stops
   everything:
 
+    firewall   adds the inbound rules if missing - ONE UAC prompt, first run
+               only. UDP 8189 especially: without it the page loads and the
+               360 view stays black forever
+    v5 upload  re-flashes slot 3 only when v5/main.py has actually changed,
+               compared by hash against .v5_deployed
     run.py     HTTPS page (8443) + WHEP proxy + WSS bridge (8765) + V5 serial
     mediamtx   repackages the camera stream as WebRTC. No transcoding
     ffmpeg     Insta360 X5 over USB -> NVENC H.264 -> mediamtx
 
-  The V5 program itself runs ON the brain and is not started here on purpose:
-  it takes whatever position the jaws are in at startup as "fully open", so
-  it must be started by hand with the jaws open. -DeployV5 uploads it for you
-  but still leaves pressing Run to you.
+  The V5 program is uploaded but deliberately NOT started: it takes whatever
+  position the jaws are in at startup as "fully open", so you must open the
+  jaws and press Run on the brain yourself.
 
 .EXAMPLE
   .\start_all.ps1
@@ -51,7 +55,8 @@ param(
   [switch] $NoSerial,             # run without the V5 (UI / twin testing)
   [switch] $NoCamera,             # robot side only
   [switch] $Test,                 # generated pattern instead of the camera
-  [switch] $DeployV5,             # upload v5/main.py to slot 3 first
+  [switch] $NoDeploy,             # don't upload v5/main.py even if it changed
+  [switch] $NoFirewall,           # don't offer to add the inbound rules
   [switch] $ShowFfmpeg,
   [switch] $Force                 # kill stale holders of our ports
 )
@@ -89,30 +94,21 @@ $tcp = @(8443, 8765); $udp = @()
 if (-not $NoCamera) { $tcp += @(8554, 8889); $udp += 8189 }
 if (-not (Test-PortsFree $tcp $udp -Force:$Force)) { exit 1 }
 
-# ------------------------------------------------------------- V5 upload ----
-if ($DeployV5) {
-  $vexcom = Find-Vexcom
-  if (-not $vexcom) {
-    Say '  error: vexcom not found (is the VEX VS Code extension installed?)' 'Red'
-    exit 1
+# ------------------------------------------- firewall + V5, automatically ---
+# Both are "set up once" chores, so they are folded in here rather than being
+# separate commands you have to remember. Each is a no-op when already done.
+if (-not $NoFirewall -and -not $NoCamera) { [void](Confirm-FirewallRules) }
+
+$v5state = 'skipped'
+if (-not $NoDeploy) {
+  $v5state = Sync-V5Program $root 3
+  switch ($v5state) {
+    'uploaded'  { Say '  [v5]       main.py changed -> uploaded to slot 3' 'Green'
+                  Say '             open the jaws, then press Run on the brain' 'Yellow' }
+    'unchanged' { Say '  [v5]       slot 3 already matches main.py' 'DarkGray' }
+    'failed'    { Say '  [v5]       upload FAILED - is the brain on and idle?' 'Red' }
+    'skipped'   { Say '  [v5]       brain not detected, skipping upload' 'DarkGray' }
   }
-  # The admin interface (USB MI_00) is the one that accepts uploads; the user
-  # interface (MI_02) is what run.py reads telemetry from.
-  $admin = Get-CimInstance Win32_PnPEntity | Where-Object {
-    $_.Name -match 'COM(\d+)' -and $_.PNPDeviceID -match 'VID_2888' -and
-    $_.PNPDeviceID -match 'MI_00'
-  } | Select-Object -First 1
-  if (-not $admin -or $admin.Name -notmatch 'COM(\d+)') {
-    Say '  error: no V5 admin port found - is the brain plugged in and on?' 'Red'
-    exit 1
-  }
-  $port = 'COM' + $Matches[1]
-  Say "  [v5]       uploading v5\main.py to slot 3 via $port" 'DarkGray'
-  $staged = Join-Path $env:TEMP 'qteleop.py'   # brain shows the filename as the name
-  Copy-Item (Join-Path $root 'v5\main.py') $staged -Force
-  & $vexcom --slot 3 --write $staged $port | Out-Null
-  if ($LASTEXITCODE -ne 0) { Say '  v5 upload FAILED' 'Red'; exit 1 }
-  Say '  [v5]       uploaded. Open the jaws, then press Run on the brain.' 'Yellow'
 }
 
 # ------------------------------------------------------------------- run ----

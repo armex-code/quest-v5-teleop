@@ -197,17 +197,26 @@ HANDOFF.md        ready-to-paste prompt to continue on a smaller model
 ```bash
 ./scripts/gen_cert.sh 192.168.137.1 10.126.73.140   # once; list every IP you may serve from
 pip install -r server/requirements.txt              # once
-.\start_camera.ps1 -AddFirewallRules                # once, as ADMIN (UDP 8189!)
 ```
-Then, **one command for everything** (page + WS + serial + 360 camera):
+Then **one command, every time** — it also does the one-time chores itself,
+each a no-op once done, so there is nothing else to remember:
 ```powershell
 .\start_all.ps1            # or double-click start_all.bat
-.\start_all.ps1 -Test      # generated pattern instead of the camera
-.\start_all.ps1 -NoCamera  # robot side only (old start_server.bat behaviour)
-.\start_all.ps1 -NoSerial  # UI / twin testing with no V5
-.\start_all.ps1 -DeployV5  # also upload v5/main.py to slot 3 first
-.\start_all.ps1 -Force     # kill stale holders of our ports from a previous run
 ```
+It adds the firewall rules if missing (one UAC prompt, first run only),
+re-flashes V5 slot 3 only when `v5/main.py`'s hash differs from
+`.v5_deployed`, then starts mediamtx + ffmpeg + run.py together. Ctrl+C
+stops all three.
+```powershell
+.\start_all.ps1 -Test        # generated pattern instead of the camera
+.\start_all.ps1 -NoCamera    # robot side only (old start_server.bat behaviour)
+.\start_all.ps1 -NoSerial    # UI / twin testing with no V5
+.\start_all.ps1 -Force       # kill stale holders of our ports from a previous run
+.\start_all.ps1 -NoDeploy    # never touch the brain
+.\start_all.ps1 -NoFirewall  # never prompt for elevation
+```
+The V5 program is uploaded but never auto-started: it takes the jaws' startup
+position as "fully open", so you must open them and press Run on the brain.
 `start_camera.ps1` still exists for camera-only debugging. Both launchers
 dot-source `scripts/lib_launch.ps1`, which owns the ffmpeg argument list — it
 lives in one place on purpose, since every value in it was measured.

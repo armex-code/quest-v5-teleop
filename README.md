@@ -77,40 +77,54 @@ Insta360 X5 ──USB──▶ ffmpeg ──rtsp──▶ mediamtx ──WHEP vi
    `https://192.168.137.1:8765` → Advanced → Proceed (the WebSocket port needs
    its own acceptance — you should see "WS bridge OK").
 
-## Every session
+## Every session — one command
 
 ```powershell
-python server/run.py        # on the PC: web page + WebSocket bridge + serial
+.\start_all.ps1        # or double-click start_all.bat
 ```
-(Options: `--serial COM5` to pin the port, `--no-serial` to test without the
-V5, `-v` to log every pose.)
 
-Then: plug in the V5 and start its program → on the Quest open
-`https://192.168.137.1:8443` → **Enter AR**.
+That's the whole thing. It starts the web page, the WebSocket bridge, the V5
+serial link, MediaMTX and ffmpeg together, and Ctrl+C stops all of them.
 
-#### …and for the 360 world (`?mode=vr`)
+It also handles the setup chores itself, each a no-op once done, so there is
+no separate first-run ritual:
 
-A second window, plus one-time firewall rules:
+- **Firewall rules**, if missing — one UAC prompt on the very first run.
+  This matters more than it looks: **UDP 8189** carries the 360 video straight
+  to the headset, bypassing the web server. Without it the page loads
+  perfectly and the world stays black forever.
+- **V5 upload** — re-flashes slot 3 only when `v5/main.py`'s hash differs from
+  `.v5_deployed`, so editing the brain program needs no extra step and an
+  unchanged one costs nothing.
+- **Stale ports** — names whatever is still holding 8443/8765/8554/8889/8189
+  from a previous run. `-Force` kills them.
 
 ```powershell
-.\start_camera.ps1 -AddFirewallRules   # once, as ADMINISTRATOR
-.\start_camera.ps1                     # mediamtx + ffmpeg
-.\start_camera.ps1 -Test               # generated pattern, no camera needed
-.\start_camera.ps1 -Probe              # list what the camera offers
+.\start_all.ps1 -Test        # generated pattern, no camera needed
+.\start_all.ps1 -NoCamera    # robot side only
+.\start_all.ps1 -NoSerial    # UI / twin testing with no V5
+.\start_all.ps1 -Force       # clear leftovers from a previous run
+.\start_all.ps1 -NoDeploy    # never touch the brain
+.\start_all.ps1 -NoFirewall  # never prompt for elevation
 ```
 
-Set the X5 to **Webcam Mode** on its own screen (it re-asks on every replug),
-then open `https://192.168.137.1:8443/?mode=vr`.
+Then: set the X5 to **Webcam Mode** on its own screen (it re-asks on every
+replug), **open the gripper jaws and press Run on slot 3** on the brain, and
+on the Quest open `https://192.168.137.1:8443` → **Enter**.
 
-The firewall step matters more than it looks: **UDP 8189** carries the video
-straight to the headset, bypassing the web server. Forget it and the page
-loads perfectly while the world stays black forever. The HUD's `CAM` chip
-tells you which half is failing.
+`start_camera.ps1` still exists for camera-only debugging (`-Probe` lists what
+the camera offers), and `python server/run.py` still works on its own.
 
-In VR mode the right controller gains **B** = recentre the 360 view on where
-you are looking, and **right stick ▲▼** = zoom. Zoom magnifies without
-sharpening — WebXR does not let an app change the field of view, so this is
-binoculars rather than a wider lens.
+### In the headset
+
+It starts **held** — the arm will not move until you press **X**. Place the
+panel where you want it with **A** first.
+
+**Y** swaps between passthrough and the 360 camera instantly, without leaving
+the session. In the 360 world the right controller also gains **B** =
+recentre the view on where you are looking, and **right stick ▲▼** = zoom.
+Zoom magnifies without sharpening — WebXR does not let an app change the
+field of view, so this is binoculars rather than a wider lens.
 
 Camera placement is worth more than any setting: stand it **upright** (lying
 flat puts the lens stitch seam horizontally across the middle of your view)
