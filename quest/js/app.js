@@ -3,10 +3,10 @@
 // No calibration: a gridded panel with the SAME proportions as the robot's
 // workspace (the yellow rectangle on the twin, scaled by PANEL_SCALE) appears
 // in front of the user and is immediately live. Controls:
-//   RIGHT controller = the pen. Trigger = pen down.
+//   RIGHT controller = the end effector. Trigger held = gripper closed.
 //   A               = move the panel to the controller (re-place it anywhere)
-//   R-stick click   = clear the twin's pen trail
-//   X (left)        = pause / resume (arm holds, pen up)
+//   R-stick click   = clear the twin's carry trail
+//   X (left)        = pause / resume (arm and gripper both hold as-is)
 //   LEFT grip hold  = carry the digital twin
 //   LEFT stick ◄ ►  = rotate the twin to match the real robot on the table
 import * as THREE from 'three';
@@ -50,8 +50,8 @@ let lastSend = 0;
 // Cursor / control state
 let ema = null;        // smoothed {x, z} of the right controller
 let lastUV = null;
-let penNow = false;
-let paused = false;    // X button: freeze the arm (server holds + raises pen)
+let gripNow = false;
+let paused = false;    // X button: freeze the arm (server holds pos + grip)
 
 // Scene objects
 let twin = null;
@@ -330,7 +330,8 @@ function buildTwin() {
   group.add(solid.shoulder);
   group.add(ghost.shoulder);
 
-  // Pen trail: preallocated line, grows via drawRange.
+  // Carry trail: preallocated line, grows via drawRange. Traces the tip
+  // whenever the gripper is closed, so you can see the path of a carry.
   const trailPos = new Float32Array(TRAIL_MAX * 3);
   const trailGeo = new THREE.BufferGeometry();
   trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPos, 3));
@@ -365,7 +366,7 @@ function updateTwin() {
   twin.ghost.shoulder.rotation.y = d2r(lastTm.qc[0]);
   twin.ghost.elbow.rotation.y = d2r(lastTm.qc[1]);
 
-  if (lastTm.pen) {
+  if (lastTm.grip) {
     twin.solid.tip.getWorldPosition(_tipWorld);
     const p = twin.group.worldToLocal(_tipWorld.clone());
     p.y = 0.003; // pin the trail just above the plate
@@ -475,7 +476,7 @@ function updatePanelCursor() {
   const pz = Math.max(-panel.halfD, Math.min(panel.halfD, ema.z - panel.group.position.z));
   panel.cursor.position.set(px, 0.006, pz);
   panel.cursor.material.color.setHex(
-    paused ? 0x8e8e93 : penNow ? 0xff3b30 : 0xffffff);
+    paused ? 0x8e8e93 : gripNow ? 0xff3b30 : 0xffffff);
 }
 
 // ── Pose streaming ───────────────────────────────────────────────────────────
@@ -491,8 +492,8 @@ function risingEdge(hand, idx, pressed) {
 }
 
 // Smooth the cursor, stream the pose.
-function updateRightCursor(x, z, penDown, time) {
-  penNow = penDown;
+function updateRightCursor(x, z, gripClosed, time) {
+  gripNow = gripClosed;
   ema = ema
     ? { x: ema.x + EMA_ALPHA * (x - ema.x),
         z: ema.z + EMA_ALPHA * (z - ema.z) }
@@ -503,10 +504,13 @@ function updateRightCursor(x, z, penDown, time) {
     const msg = {
       t: 'p', s: ++seq,
       x: round3(ema.x), z: round3(ema.z),
-      pen: penDown && !paused ? 1 : 0,
+      // Raw trigger state. While paused the server ignores this frame for
+      // actuation (u/v are withheld below) and so holds the last grip — don't
+      // send 0 here, since for a gripper 0 means "open" i.e. drop the object.
+      grip: gripClosed ? 1 : 0,
       ts: Math.round(time * 10) / 10,
     };
-    // While paused, u/v are withheld: the server holds position + raises pen.
+    // While paused, u/v are withheld: the server holds position + grip.
     if (lastUV && !paused) { msg.u = round4(lastUV.u); msg.v = round4(lastUV.v); }
     wsSend(msg);
   }
@@ -552,8 +556,8 @@ function onFrame(time, frame) {
         if (card) {
           card.sp.position.set(p.x, p.y + 0.11, p.z);
           card.sp.visible = true;
-          drawCtlCard(card, 'RIGHT — the pen', [
-            ['Trigger', penNow ? 'pen DOWN' : 'pen down', trigger],
+          drawCtlCard(card, 'RIGHT — the gripper', [
+            ['Trigger', gripNow ? 'GRIPPING' : 'close gripper', trigger],
             ['A', 'move panel here', btn(4)],
             ['Stick press', 'clear trail', btn(3)],
           ]);
@@ -602,7 +606,7 @@ function buildHudModel(rightSeen) {
   const m = {
     wsOk: wsStatus === 'connected',
     v5Ok: serialOk,
-    pen: penNow,
+    grip: gripNow,
     tm: lastTm,
     uv: lastUV,
   };
@@ -619,14 +623,14 @@ function buildHudModel(rightSeen) {
     m.lines = ['Press any button on it.'];
   } else if (paused) {
     m.paused = true;
-    m.step = 'PAUSED — ARM HOLDING';
+    m.step = 'PAUSED — ARM AND GRIP HOLDING';
     m.lines = ['Press X (left controller) to resume.'];
   } else {
     m.live = true;
-    m.step = m.pen ? 'DRAWING' : 'LIVE — ARM FOLLOWS YOUR HAND';
+    m.step = m.grip ? 'GRIPPER CLOSED' : 'LIVE — ARM FOLLOWS YOUR HAND';
     m.lines = [
-      'The blue panel is the robot’s drawing area.',
-      'Trigger = pen.  A: move panel to your hand.',
+      'The blue panel is the robot’s reachable area.',
+      'Trigger = close gripper.  A: move panel to your hand.',
       'X: pause   R-stick: clear trail',
     ];
   }
@@ -658,10 +662,10 @@ function drawHud(m) {
   if (m.live) {
     ctx.beginPath();
     ctx.arc(830, 52, 13, 0, Math.PI * 2);
-    ctx.fillStyle = m.pen ? '#ff453a' : '#8e8e93';
+    ctx.fillStyle = m.grip ? '#ff453a' : '#8e8e93';
     ctx.fill();
     ctx.fillStyle = '#e8edf2';
-    ctx.fillText(`PEN ${m.pen ? 'DOWN' : 'up'}`, 858, 54);
+    ctx.fillText(`GRIP ${m.grip ? 'CLOSED' : 'open'}`, 858, 54);
   }
 
   ctx.strokeStyle = 'rgba(232,237,242,0.18)';

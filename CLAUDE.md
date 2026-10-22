@@ -20,17 +20,21 @@ with a Three.js digital twin mirroring real encoder state back into the headset.
 
 ## Milestone tracker
 
-> CURRENT: **all milestones built (2026-07-07) — awaiting first hardware test**
+> CURRENT: **all milestones built (M6 gripper added 2026-10-22) — awaiting
+> first hardware test**
 
 - [x] M0 — Repo structure, CLAUDE.md, PROTOCOL.md, HTTPS cert flow
 - [ ] M1 — WebXR immersive-ar page, controller readout (built ✅ / confirmed ❌)
 - [ ] M2 — WebSocket streaming Quest → host (built ✅ / confirmed ❌)
 - [ ] M3 — Host → V5 serial; IK runs ON the V5 (built ✅ / confirmed ❌)
-- [ ] M4 — 2-corner calibration, EMA smoothing, pen flag (built ✅ / confirmed ❌)
+- [ ] M4 — Fixed drawing panel, EMA smoothing, grip flag (built ✅ / confirmed ❌)
 - [ ] M5 — Digital twin + telemetry return path (built ✅ / confirmed ❌)
+- [ ] M6 — Gripper end effector, trigger-driven (built ✅ / confirmed ❌)
 
 Suggested first-test order: M1 page alone → WS connect (`--no-serial`) →
-serial with V5 on blocks (motors free) → calibrated control → twin accuracy.
+serial with V5 on blocks (motors free) → arm follows the hand → twin accuracy
+→ gripper last, and bench it with the arm motors unpowered first so a bad
+`GRIP_*` constant can't swing the arm while you watch the jaws.
 
 ## Key design facts (learned from the user's khatt-bot code — don't re-ask)
 
@@ -40,16 +44,32 @@ serial with V5 on blocks (motors free) → calibrated control → twin accuracy.
   project (original lives in their khatt-bot GitHub repo; local copy deleted
   2026-07-07 after absorbing it).
 - The host just forwards normalized coords over USB serial:
-  `"u,v,pen\n"` at ≤25 Hz, 115200 baud. Same wire format as the user's old
-  pygame project, so the old V5 program also still works (minus telemetry).
+  `"u,v,grip\n"` at ≤25 Hz, 115200 baud. Field-for-field the same wire format
+  as the user's old pygame project (the third field was `pen` there), so the
+  old V5 program also still works (minus telemetry and the gripper).
 - **L1 = 20.5 cm, L2 = 30.5 cm**, workspace lateral ±10.5 cm × depth 18–48 cm
   (values from the V5 program; older files said 21.5/28 — if the twin looks
   wrong, ask the user to re-measure).
 - Telemetry is the one V5-side addition: `"E,q1,q2,c1,c2\n"` at 20 Hz
   (measured & commanded arm-frame degrees, gear ratio divided out).
-- Motors: shoulder PORT1 (36:1, reversed), elbow PORT4 (18:1). Pen servo was
-  on Pi GPIO in the old project; **no pen actuator currently** — the pen flag
-  is transported end-to-end but only stored on the V5.
+- Motors: shoulder PORT1 (36:1, reversed), elbow PORT4 (18:1), **gripper
+  PORT2 (36:1)** — added 2026-10-22. Gripper travel is **user-measured**:
+  fully open = 0 (the startup pose), fully closed = **-237 motor degrees**.
+  All in `GRIP_*` at the top of `v5/main.py`. Still unconfirmed: the *port*
+  (PORT2 was assumed) and the torque percentages (set conservatively — see
+  below).
+- Gripper squeeze torque is halved vs an 18:1 build because the 36:1 cartridge
+  roughly doubles output torque per percent. Biased gentle on purpose: a weak
+  grip drops the object, an overstrong one strips the gripper. Raise
+  `GRIP_TORQUE_PCT` if objects slip; don't raise it speculatively.
+- Closing *direction* is the sign of `GRIP_CLOSED_DEG`, not `GRIP_REVERSED` —
+  flipping both cancels out. Only touch `GRIP_REVERSED` if the motor is
+  mounted mirrored.
+- The gripper **replaced the pen** end to end; there is no pen actuator and no
+  pen flag any more (protocol v0.3 renamed `pen` → `grip`). The old project's
+  pen servo was on Pi GPIO and is gone.
+- The gripper program takes wherever the jaws sit at startup as "fully open"
+  (it calls `reset_position()`), so **start the V5 program with the jaws open**.
 
 ## Hardware / network facts
 
@@ -65,7 +85,7 @@ serial with V5 on blocks (motors free) → calibrated control → twin accuracy.
 ## Architecture
 
 ```
-Quest controller ──WebXR page (quest/)──wss:8765──▶ PC server/run.py ──"u,v,pen"──serial──▶ V5 (IK + P-loop) ──▶ motors
+Quest controller ──WebXR page (quest/)──wss:8765──▶ PC server/run.py ──"u,v,grip"──serial──▶ V5 (IK + P-loop) ──▶ motors + gripper
 Quest twin (ghost+solid) ◀──wss "tm" ◀── PC ◀──"E,q1,q2,c1,c2"──serial ◀── V5 encoders
 ```
 
@@ -83,8 +103,10 @@ Quest twin (ghost+solid) ◀──wss "tm" ◀── PC ◀──"E,q1,q2,c1,c2"
   link 1), gear ratio divided out.
 - **Rates:** Quest sends ~25 Hz (EMA-smoothed on the Quest). Host acts on the
   **latest** pose only (per-connection `s` sequence numbers). V5 telemetry 20 Hz.
-- **Pen:** trigger pressed = pen down = `1`. Host raises pen if poses go stale
-  (500 ms).
+- **Gripper:** trigger pressed = jaws closed = `1`. If poses go stale
+  (`POSE_STALE_S`, 1 s) the host **freezes** the grip value instead of zeroing
+  it — never auto-open, because that drops the payload. Same reasoning applies
+  to pause (X) and the kill switch, which both hold the jaws shut.
 - Messages: compact single-letter-keyed JSON, one per WebSocket text frame.
   Full schema in `PROTOCOL.md` (including the serial framing).
 - Quest page is plain ES modules + Three.js vendored locally
@@ -117,10 +139,12 @@ HANDOFF.md        ready-to-paste prompt to continue on a smaller model
 pip install -r server/requirements.txt   # once
 python server/run.py                     # everything (add --no-serial to test without V5)
 ```
-Deploy `v5/main.py` to the brain from VEXcode and start it. On the Quest
-(connected to the PC hotspot): accept the cert at `https://<PC_IP>:8443` AND
-`https://<PC_IP>:8765`, then open the first URL → Enter AR → calibrate with
-A/B → draw. Full walkthrough in docs/HTTPS_SETUP.md.
+Deploy `v5/main.py` to the brain from VEXcode and start it **with the gripper
+jaws open** (startup pose = fully open). On the Quest (connected to the PC
+hotspot): accept the cert at `https://<PC_IP>:8443` AND `https://<PC_IP>:8765`,
+then open the first URL → Enter AR → the panel is live immediately (no
+calibration) → move your hand, squeeze the trigger to grip.
+Full walkthrough in docs/HTTPS_SETUP.md.
 
 ## Usage-limit / model handoff rule
 

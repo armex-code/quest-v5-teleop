@@ -1,4 +1,9 @@
-# Wire Protocol — v0.2
+# Wire Protocol — v0.3
+
+> **v0.3 breaking change:** the `pen` field is renamed `grip` everywhere (`p`
+> and `tm` messages, and the serial frame) now that a smart-motor gripper is
+> fitted as the end effector. `1` = closed, `0` = open. The stale-pose rule
+> changed with it — see *Reliability rules*.
 
 Two links, both carrying compact line/frame-oriented messages:
 
@@ -21,14 +26,14 @@ to themselves, never across machines).
 Sent at ~25 Hz while an AR session is active and the right controller is tracked.
 
 ```json
-{"t":"p","s":1042,"x":0.132,"z":-0.410,"pen":1,"u":0.62,"v":0.31,"ts":81234.5}
+{"t":"p","s":1042,"x":0.132,"z":-0.410,"grip":1,"u":0.62,"v":0.31,"ts":81234.5}
 ```
 
 | key | type  | meaning |
 |-----|-------|---------|
 | s   | int   | per-connection monotonically increasing sequence number. Host drops any frame with `s` ≤ last seen on that connection. |
 | x,z | float | raw right-controller position in Quest reference space, meters (EMA-smoothed on the Quest before sending) |
-| pen | 0/1   | trigger state (1 = pressed = pen down); forced 0 while paused (X button) |
+| grip | 0/1  | trigger state (1 = pressed = gripper closed). Sent raw even while paused — a paused frame carries no `u,v`, so the host ignores it for actuation and holds the last grip rather than opening the jaws. |
 | u,v | float | position inside the fixed drawing panel, [0,1]. **Absent while paused** — the host actuates only when present. `u` = depth axis (near edge 0 → far edge 1), `v` = lateral axis (left 0 → right 1). The panel has the workspace's proportions (scaled) and is placed with the A button; no calibration. |
 | ts  | float | quest-local ms timestamp |
 
@@ -58,18 +63,22 @@ drives.
 Relayed from the V5 at its telemetry rate (20 Hz) while connected.
 
 ```json
-{"t":"tm","q":[34.2,-71.9],"qc":[35.0,-70.5],"pen":1,"ts":91234.5}
+{"t":"tm","q":[34.2,-71.9],"qc":[35.0,-70.5],"grip":1,"ts":91234.5}
 ```
 
 | key | meaning |
 |-----|---------|
 | q   | `[q1,q2]` actual encoder angles (arm frame, degrees, gear ratio already divided out) |
 | qc  | `[q1,q2]` last commanded (IK output) angles, degrees — drives the ghost |
-| pen | pen state as last commanded by the host |
+| grip | gripper state as last commanded by the host (1 = closed) |
 
 The twin renders `qc` as the translucent ghost and `q` as the solid arm, both
-via scene-graph FK with L1/L2 from `cfg`. The pen trail is appended from the
-**solid** tip position whenever `pen == 1`.
+via scene-graph FK with L1/L2 from `cfg`. The carry trail is appended from the
+**solid** tip position whenever `grip == 1`.
+
+Gripper *joint* angle is deliberately not telemetered — the twin has no jaw
+geometry, and the host already knows the commanded state. If the twin ever
+grows jaws, add a sixth field to the serial frame rather than overloading `q`.
 
 ### `st` — status / error
 
@@ -85,13 +94,16 @@ Sent on connect and whenever the serial link state changes.
 ### Host → V5 — target frame (≤ 25 Hz)
 
 ```
-<u>,<v>,<pen>\n        e.g.  0.512300,0.480010,1
+<u>,<v>,<grip>\n       e.g.  0.512300,0.480010,1
 ```
 
 `u,v ∈ [0,1]` forwarded verbatim from the Quest's calibrated coords. The V5's
 `normalized_to_workspace()` maps them to arm-frame cm (field 1 → the 18–48 cm
 depth band, field 2 → the ±10.5 cm lateral band) and its Jacobian IK + P-loop
-do the rest. `pen` is parsed and stored (no pen actuator fitted currently).
+do the rest. `grip` drives the gripper motor: `1` closes it at
+`GRIP_TORQUE_PCT` until it stalls on the object and then holds at the lower
+`GRIP_HOLD_TORQUE_PCT`, `0` returns it to `GRIP_OPEN_DEG`. All of those
+constants are at the top of `v5/main.py`.
 
 ### V5 → host — telemetry (20 Hz)
 
@@ -110,6 +122,10 @@ treated as V5 debug output and logged, never parsed.
   always the latest pose.
 - If the socket drops, the Quest auto-reconnects with backoff (1 s → 5 s) and
   resets `s` to 0; the host treats each connection as a fresh sequence space.
-- If the host sees no fresh `p` for 500 ms while the pen is down, it re-sends
-  the last position with `pen=0` (hold position, raise pen).
+- If the host sees no fresh `p` for `POSE_STALE_S` (1 s — raised from 500 ms
+  because Quest casting makes the stream bursty), it keeps commanding the last
+  position and **freezes `grip` at its last value**. This is the opposite of
+  the old pen rule, which forced `pen=0`: a pen is safe to raise on a dropout,
+  but opening a gripper would drop whatever it is carrying. Nothing in the
+  stack ever opens the jaws on its own — only a released trigger does.
 - If the V5 serial link drops, the host retries every 2 s and reports via `st`.

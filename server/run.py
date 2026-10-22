@@ -9,8 +9,8 @@ on the same network as the Quest with a USB cable to the V5 brain):
   3. USB serial link to the VEX V5 brain      (auto-detected, 115200 baud)
 
 Data flow (see PROTOCOL.md):
-  Quest "p" msg (u,v,pen) --> serial "u,v,pen\\n" --> V5 (IK runs ON the brain)
-  V5 "E,q1,q2,c1,c2\\n"   --> WSS "tm" msg       --> Quest digital twin
+  Quest "p" msg (u,v,grip) --> serial "u,v,grip\\n" --> V5 (IK runs ON the brain)
+  V5 "E,q1,q2,c1,c2\\n"    --> WSS "tm" msg        --> Quest digital twin
 
 The server runs fine with no V5 attached (it keeps retrying every 2 s and
 tells the Quest via "st" messages) so the twin/UI can be tested standalone.
@@ -51,7 +51,7 @@ WORKSPACE = [-10.5, 10.5, 18.0, 48.0]  # arm-frame cm: x_min, x_max, y_min, y_ma
 VEX_USB_VID = 0x2888          # VEX Robotics
 # Casting/recording on the Quest steals Wi-Fi airtime and makes the pose
 # stream bursty; 1 s tolerates that while the slew limiter keeps motion safe.
-POSE_STALE_S = 1.0            # no fresh pose for this long -> force pen up
+POSE_STALE_S = 1.0            # no fresh pose for this long -> hold (see pump)
 SERIAL_TX_INTERVAL = 0.04     # 25 Hz max toward the V5
 
 # Direction mapping, applied in this order to each incoming (u, v):
@@ -81,9 +81,9 @@ class Bridge:
         self.ser_lock = threading.Lock()
 
         # Latest pose from the Quest (latest-wins; the pump drains it).
-        self.latest = None            # (u, v, pen)
+        self.latest = None            # (u, v, grip)
         self.last_pose_time = 0.0
-        self.last_sent_pen = 0
+        self.last_sent_grip = 0
         self.stale_notified = False
 
     # ── WebSocket side ────────────────────────────────────────────────────
@@ -124,8 +124,8 @@ class Bridge:
         self.last_pose_time = time.monotonic()
         u, v = msg.get("u"), msg.get("v")
         if u is None or v is None:
-            return  # uncalibrated — HUD-only, never actuate
-        pen = 1 if msg.get("pen") else 0
+            return  # paused on the Quest — HUD-only, never actuate
+        grip = 1 if msg.get("grip") else 0
         u = max(0.0, min(1.0, u))
         v = max(0.0, min(1.0, v))
         if SWAP_UV:
@@ -134,9 +134,9 @@ class Bridge:
             u = 1.0 - u
         if FLIP_V:
             v = 1.0 - v
-        self.latest = (u, v, pen)
+        self.latest = (u, v, grip)
         if self.verbose:
-            print(f"[pose] u={u:.3f} v={v:.3f} pen={pen}")
+            print(f"[pose] u={u:.3f} v={v:.3f} grip={grip}")
 
     def _status_msg(self):
         if self.no_serial:
@@ -228,18 +228,18 @@ class Bridge:
             "t": "tm",
             "q": [round(q1, 2), round(q2, 2)],
             "qc": [round(c1, 2), round(c2, 2)],
-            "pen": self.last_sent_pen,
+            "grip": self.last_sent_grip,
             "ts": round(time.monotonic() * 1000, 1),
         }))
 
-    def send_frame(self, u, v, pen):
+    def send_frame(self, u, v, grip):
         with self.ser_lock:
             ser = self.ser
         if not ser:
             return
         try:
-            ser.write(f"{u:.6f},{v:.6f},{pen}\n".encode("ascii"))
-            self.last_sent_pen = pen
+            ser.write(f"{u:.6f},{v:.6f},{grip}\n".encode("ascii"))
+            self.last_sent_grip = grip
         except Exception as e:
             print(f"[serial] write failed: {e}")
 
@@ -252,14 +252,19 @@ class Bridge:
             await asyncio.sleep(SERIAL_TX_INTERVAL)
             if self.latest is None:
                 continue
-            u, v, pen = self.latest
+            u, v, grip = self.latest
 
             stale = time.monotonic() - self.last_pose_time > POSE_STALE_S
             if stale:
-                pen = 0  # hold position, raise pen
+                # Freeze the grip state rather than forcing it open: a pen
+                # would be safe to raise on a dropout, but releasing the
+                # gripper here would drop whatever it is carrying. The arm
+                # still coasts to a stop at the last commanded point.
+                grip = self.last_sent_grip
                 if not self.stale_notified:
                     self.stale_notified = True
-                    print("[safety] pose stream stale — pen raised")
+                    print("[safety] pose stream stale — holding position "
+                          f"and grip={grip}")
             else:
                 self.stale_notified = False
 
@@ -272,8 +277,8 @@ class Bridge:
                 sv += dv
 
             moved = (lu is None or abs(su - lu) > 1e-4 or abs(sv - lv) > 1e-4)
-            if moved or pen != self.last_sent_pen:
-                self.send_frame(su, sv, pen)
+            if moved or grip != self.last_sent_grip:
+                self.send_frame(su, sv, grip)
                 lu, lv = su, sv
 
 

@@ -6,10 +6,12 @@
 #   1. Telemetry: prints "E,q1,q2,c1,c2\n" over USB serial at 20 Hz
 #      (q = measured arm-frame angles from encoders, c = last commanded), which
 #      server/run.py forwards to the Quest.
-#   2. Pen flag from the incoming frames is stored (servo not fitted right now).
+#   2. Gripper end effector: the third field of each frame closes (1) or opens
+#      (0) a smart-motor gripper. Torque-limited while closing, and it backs
+#      off to a lower holding torque once stalled against the object.
 #
 # Serial input (from server/run.py), one line per frame at <= 25 Hz:
-#   "<x_norm>,<y_norm>,<pen>\n"   e.g. "0.512300,0.480010,1"
+#   "<x_norm>,<y_norm>,<grip>\n"   e.g. "0.512300,0.480010,1"
 from vex import *
 import math
 import random
@@ -27,8 +29,36 @@ GEAR_RATIO = 84 / 12  # external gear ratio = 7
 L_SHOULDER = 20.5
 L_ELBOW = 30.5
 
+# ── Gripper end effector ─────────────────────────────────────────────────────
+# Travel measured on the real gripper (2026-10-22): fully open is the startup
+# pose, fully closed is -237 motor degrees from it. The encoder is zeroed at
+# startup (reset_position below), so only that *difference* is meaningful —
+# always start the program with the jaws OPEN.
+# Closing direction lives in the SIGN of GRIP_CLOSED_DEG. Leave GRIP_REVERSED
+# alone unless the motor is physically mounted mirrored; flipping both just
+# cancels out and the jaws drive the wrong way again.
+GRIP_PORT = Ports.PORT2        # TODO confirm — PORT1/PORT4 are shoulder/elbow
+GRIP_GEARING = GearSetting.RATIO_36_1   # 36:1 cartridge
+GRIP_REVERSED = False
+GRIP_OPEN_DEG = 0              # = the startup pose
+GRIP_CLOSED_DEG = -237         # motor degrees at fully closed on nothing
+GRIP_VELOCITY_PCT = 60         # 36:1 is 100 rpm free -> full close in ~0.7 s
+# Squeeze torque is halved relative to an 18:1 build: the 36:1 cartridge gives
+# roughly double the output torque for the same percentage. Deliberately gentle
+# for the first run — a weak grip drops the object (recoverable), an overstrong
+# one strips the gripper (not). Raise GRIP_TORQUE_PCT if objects slip.
+GRIP_TORQUE_PCT = 20           # squeeze torque while closing
+GRIP_HOLD_TORQUE_PCT = 8       # reduced torque once stalled on the object
+GRIP_STALL_TICKS = 15          # 20 ms ticks of ~no motion before "stalled"
+
+gripper_motor = Motor(GRIP_PORT, GRIP_GEARING, GRIP_REVERSED)
+
 shoulder_motor.reset_position()
 elbow_motor.reset_position()
+gripper_motor.reset_position()
+gripper_motor.set_velocity(GRIP_VELOCITY_PCT, PERCENT)
+gripper_motor.set_max_torque(GRIP_TORQUE_PCT, PERCENT)
+gripper_motor.set_stopping(HOLD)
 
 stop_requested = False
 reset_requested = False
@@ -40,6 +70,8 @@ def watch_kill_switch():
             stop_requested = True
             shoulder_motor.stop(BRAKE)
             elbow_motor.stop(BRAKE)
+            # HOLD, not COAST: killing the arm shouldn't drop a held object.
+            gripper_motor.stop(HOLD)
             brain.program_stop()
         wait(20, MSEC)
 
@@ -137,7 +169,7 @@ def normalized_to_workspace(x_norm, y_norm):
     return x, y
 
 target_angles = {"theta1": 0.0, "theta2": 0.0}
-pen_down = False
+grip_closed = False
 
 # Toned down from the original 70/8/0.3 for teleop: hand tracking is noisier
 # than a mouse, so favor smoothness over speed.
@@ -211,6 +243,47 @@ def control_loop():
 
 Thread(control_loop)
 
+def gripper_loop():
+    # Drives the gripper to whatever grip_closed currently says. Closing is a
+    # torque-limited move onto the object rather than a position it must reach,
+    # so an object of any size is gripped by the same command; once motion
+    # stops the torque drops to GRIP_HOLD_TORQUE_PCT so the motor isn't held at
+    # full squeeze for as long as the object is carried.
+    last_cmd = None
+    stalled = False
+    low_ticks = 0
+
+    while True:
+        if stop_requested:
+            gripper_motor.stop(HOLD)
+            return
+
+        want_closed = grip_closed
+
+        if want_closed != last_cmd:
+            last_cmd = want_closed
+            stalled = False
+            low_ticks = 0
+            gripper_motor.set_max_torque(GRIP_TORQUE_PCT, PERCENT)
+            gripper_motor.spin_to_position(
+                GRIP_CLOSED_DEG if want_closed else GRIP_OPEN_DEG,
+                DEGREES, wait=False)
+
+        # Only de-rate while closing: a stalled *open* means something is
+        # jammed in the jaws, and backing off the torque there wouldn't help.
+        if want_closed and not stalled:
+            if abs(gripper_motor.velocity(PERCENT)) < 5:
+                low_ticks += 1
+                if low_ticks >= GRIP_STALL_TICKS:
+                    stalled = True
+                    gripper_motor.set_max_torque(GRIP_HOLD_TORQUE_PCT, PERCENT)
+            else:
+                low_ticks = 0
+
+        wait(20, MSEC)
+
+Thread(gripper_loop)
+
 def telemetry_loop():
     # "E,q1,q2,c1,c2" at 20 Hz: measured and commanded arm-frame angles in
     # degrees. print() goes out the USB user port, same link stdin reads from.
@@ -237,7 +310,8 @@ def screen_loop():
                            (shoulder_motor.position(DEGREES) / GEAR_RATIO,
                             elbow_motor.position(DEGREES) / GEAR_RATIO))
         brain.screen.set_cursor(2, 1)
-        brain.screen.print("pen " + ("DOWN" if pen_down else "up"))
+        brain.screen.print("grip " + ("CLOSED" if grip_closed else "open")
+                           + "  %.0f deg" % gripper_motor.position(DEGREES))
         wait(250, MSEC)
 
 Thread(screen_loop)
@@ -250,7 +324,7 @@ while True:
             if len(parts) == 3:
                 x = float(parts[0])     # 0.0 to 1.0
                 y = float(parts[1])     # 0.0 to 1.0
-                pen_down = int(parts[2]) == 1   # stored; servo not fitted yet
+                grip_closed = int(parts[2]) == 1  # gripper_loop acts on this
 
                 go_to(x, y)
         except:
