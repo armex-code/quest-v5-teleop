@@ -35,6 +35,17 @@ GEAR_RATIO = 84 / 12  # external gear ratio = 7
 L_SHOULDER = 20.5
 L_ELBOW = 30.5
 
+# Joint limits, read off the brain 2026-10-22: +-900 MOTOR degrees on each
+# joint, so +-900/7 = +-128.6 at the joint itself. Zero is the fully extended
+# startup pose, because reset_position() runs below -- which is why the arm
+# must be started straight out along the depth axis.
+#
+# These matter: the Jacobian solver below is pure geometry and knows nothing
+# about stops, so without this check it will happily converge on a pose the
+# arm cannot physically reach (the near edge of the old workspace needed
+# ~151 deg of elbow) and the P-loop then drives the motor into its hard stop.
+JOINT_LIMIT_DEG = 900.0 / GEAR_RATIO
+
 # ── Gripper end effector ─────────────────────────────────────────────────────
 # Travel measured on the real gripper (2026-10-22): fully open is the startup
 # pose, fully closed is -237 motor degrees from it. The encoder is zeroed at
@@ -144,19 +155,33 @@ def calculate_inverse_jacobian_pure(x_target, y_target,
 
         return theta1, theta2, False
 
+    def wrap_deg(rad):
+        # The solver can walk past +-180; fold it back so the limit test is
+        # about the pose, not the number of turns taken to describe it.
+        d = math.degrees(rad)
+        return (d + 180.0) % 360.0 - 180.0
+
+    def usable(t1, t2):
+        """Converged AND inside the joint stops. Both, or it is no solution."""
+        return (abs(wrap_deg(t1)) <= JOINT_LIMIT_DEG and
+                abs(wrap_deg(t2)) <= JOINT_LIMIT_DEG)
+
     init_t1 = theta1_init if theta1_init is not None else math.atan2(y_target, x_target)
     init_t2 = theta2_init if theta2_init is not None else 0.1
 
     best = attempt(init_t1, init_t2)
-    if best[2]:
-        return math.degrees(best[0]), math.degrees(best[1])
+    if best[2] and usable(best[0], best[1]):
+        return wrap_deg(best[0]), wrap_deg(best[1])
 
+    # Restarts also serve to find the OTHER elbow branch: a point can be
+    # reachable elbow-up and out of range elbow-down, and the first attempt
+    # seeds from the current pose so it tends to stay on one branch.
     for _ in range(num_restarts):
         t1 = random.uniform(-math.pi, math.pi)
         t2 = random.uniform(-math.pi, math.pi)
         result = attempt(t1, t2)
-        if result[2]:
-            return math.degrees(result[0]), math.degrees(result[1])
+        if result[2] and usable(result[0], result[1]):
+            return wrap_deg(result[0]), wrap_deg(result[1])
 
     brain.screen.clear_screen()
     brain.screen.set_cursor(1, 1)
@@ -164,17 +189,21 @@ def calculate_inverse_jacobian_pure(x_target, y_target,
     return None  # signal failure clearly instead of silently returning (0,0)
 
 def normalized_to_workspace(x_norm, y_norm):
-    # 28 x 28 cm SQUARE, widened from the old 21 x 30 rectangle 2026-10-22.
+    # 48 cm wide x 15 cm deep, fitted to the arm's REAL reach 2026-10-22.
     #
-    # Geometry check against the reachable annulus (L1=20.5, L2=30.5, so
-    # reach is 10.0 .. 51.0 cm from the shoulder):
-    #   far corner  (depth 44, lateral 14) -> r = 46.2 cm, 4.8 cm of margin
-    #   nearest pt  (depth 16, lateral 0)  -> r = 16.0 cm, 6.0 cm of margin
-    # Worth noting the OLD rectangle was tighter than this: its far corners
-    # sat at r = 49.1, only 1.9 cm short of full extension. So this is both
-    # 24% more area AND further from the singularity at full stretch.
-    X_MIN, X_MAX = -14.0, 14.0   # lateral
-    Y_MIN, Y_MAX = 16.0, 44.0    # depth
+    # Derived from the measured joint limits (+-128.6 deg each) rather than
+    # from link lengths alone, because the elbow limit is what binds:
+    #   |q2| <= 128.6  =>  the arm cannot fold tighter than r = 23.9 cm,
+    #   so the inner boundary is 23.9, NOT the 10.0 that L2-L1 suggests.
+    # Both earlier workspaces ignored that and put their near edge at depth
+    # 16-18, i.e. inside the hole -- the solver would "reach" those points
+    # with ~151 deg of elbow and drive the motor into its stop.
+    #
+    # A square is a bad shape in this ring (the hole eats the near edge while
+    # full extension caps the far one): the biggest square is 20x20 = 400
+    # cm2, versus 744 cm2 for this rectangle. Wider also suits pick-and-place.
+    X_MIN, X_MAX = -24.0, 24.0   # lateral
+    Y_MIN, Y_MAX = 26.0, 41.0    # depth
     x_norm = max(0.0, min(1.0, x_norm))
     y_norm = max(0.0, min(1.0, y_norm))
 

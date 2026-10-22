@@ -50,9 +50,24 @@ serial with V5 on blocks (motors free) → arm follows the hand → twin accurac
   `"u,v,grip\n"` at ≤25 Hz, 115200 baud. Field-for-field the same wire format
   as the user's old pygame project (the third field was `pen` there), so the
   old V5 program also still works (minus telemetry and the gripper).
-- **L1 = 20.5 cm, L2 = 30.5 cm**, workspace lateral ±10.5 cm × depth 18–48 cm
-  (values from the V5 program; older files said 21.5/28 — if the twin looks
-  wrong, ask the user to re-measure).
+- **L1 = 20.5 cm, L2 = 30.5 cm**. Workspace is **lateral ±24 cm × depth
+  26–41 cm** (48 wide × 15 deep), set 2026-10-22 from the **measured joint
+  limits**, not from link lengths.
+- **Joint limits (user-measured, trust them): ±900 MOTOR degrees on each
+  joint = ±128.6° at the joint** after the 84/12 external ratio. Zero is the
+  **fully extended** startup pose — `reset_position()` runs at startup, so
+  **the arm must be started straight out along the depth axis**, exactly as
+  the jaws must be started open. `JOINT_LIMIT_DEG` in `v5/main.py`.
+- The elbow limit is what binds: `|q2| ≤ 128.6°` means the arm **cannot fold
+  tighter than r = 23.9 cm**, so the inner boundary is 23.9, NOT the 10.0
+  that `|L2−L1|` suggests. Both earlier workspaces put their near edge at
+  depth 16–18, i.e. *inside that hole* — the solver would "reach" those
+  points with ~151° of elbow and drive the motor into its stop.
+- A **square is a bad shape** in this ring: largest square is 20×20 = 400 cm²
+  versus 744 cm² for the 48×15 rectangle. Don't "tidy" it back to a square.
+- The Jacobian solver is pure geometry and knows nothing about stops, so it
+  now rejects out-of-limit solutions and keeps restarting to find the other
+  elbow branch. Never remove that check.
 - Telemetry is the one V5-side addition: `"E,q1,q2,c1,c2\n"` at 20 Hz
   (measured & commanded arm-frame degrees, gear ratio divided out).
 - Motors, **all three ports user-confirmed 2026-10-22**: shoulder **PORT11**

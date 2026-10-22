@@ -58,13 +58,20 @@ robot's physical orientation.
 
 Lets the twin match the real arm without hardcoding. `ws` is the reachable
 workspace rectangle in arm cm: `[lat_min, lat_max, fwd_min, fwd_max]`.
-`swap` mirrors the server's `SWAP_UV` constant; when 1 the client builds the
-drawing panel transposed so its proportions stay true to what each hand axis
-drives.
+
+`swap`, `fu`, `fv` mirror the server's `SWAP_UV` / `FLIP_U` / `FLIP_V`
+constants. The client needs all three: `swap` to build the panel transposed
+so its proportions stay true to what each hand axis drives, and all three
+together to work out which panel edge drives the arm to its **furthest**
+reach, which it marks with an orange edge and arrow. Without that cue a bare
+rectangle gives no way to tell a correct mapping from a mirrored one.
 
 ```json
-{"t":"cfg","l1":20.5,"l2":30.5,"ws":[-10.5,10.5,18,48],"swap":1}
+{"t":"cfg","l1":20.5,"l2":30.5,"ws":[-24,24,26,41],"swap":1,"fu":0,"fv":1}
 ```
+
+`fu`/`fv` were added in v0.4; a client that ignores them still works, it just
+cannot draw the orientation cue.
 
 ### `tm` — telemetry
 

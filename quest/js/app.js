@@ -50,6 +50,8 @@ const TWIN_SCALE = 0.006;    // meters per arm-cm → ~31 cm twin for a 51 cm ar
 // harder), while the WORKSPACE in v5/main.py is what the *robot* can reach.
 // With a 28 cm square workspace, 1.8 gives a ~50 cm square panel.
 const PANEL_SCALE = 1.8;
+// Grid cell = this many cm of real workspace, so counting cells is a distance.
+const GRID_CM = 5;
 const PANEL_POS = [0, 1.0, -0.45]; // default panel spot (relative to start)
 const TRAIL_MAX = 4000;      // points
 
@@ -63,7 +65,7 @@ const prevButtons = { left: {}, right: {} };
 // Arm geometry (cm) — defaults match v5/main.py; overwritten by "cfg" msg.
 // swap=1: the server transposes u/v for the robot's physical orientation, so
 // the panel is built transposed too (its long axis = the workspace long axis).
-let cfg = { l1: 20.5, l2: 30.5, ws: [-10.5, 10.5, 18, 48], swap: 1 };
+let cfg = { l1: 20.5, l2: 30.5, ws: [-24, 24, 26, 41], swap: 1, fu: 0, fv: 1 };
 
 // WebSocket state
 let ws = null;
@@ -119,7 +121,8 @@ function connectWS() {
       lastTm = msg;
     } else if (msg.t === 'cfg') {
       const next = { l1: msg.l1, l2: msg.l2, ws: msg.ws || cfg.ws,
-                     swap: msg.swap ?? cfg.swap };
+                     swap: msg.swap ?? cfg.swap,
+                     fu: msg.fu ?? cfg.fu, fv: msg.fv ?? cfg.fv };
       const changed = JSON.stringify(next) !== JSON.stringify(cfg);
       cfg = next;
       if (changed && renderer) { buildTwin(); buildPanel(); }
@@ -474,6 +477,35 @@ function updateTwin() {
 
 // ── Fixed drawing panel (same proportions as the robot workspace) ───────────
 
+/**
+ * Which panel edge sends the arm to its maximum depth, given the server's
+ * SWAP_UV / FLIP_U / FLIP_V.
+ *
+ * Panel axes as sent by panelUV(): u is depth-on-panel (pz = +halfD is u=0,
+ * nearest you), v is lateral (px = -halfW is v=0). The server computes
+ * robot-depth from `swap ? v : u`, then inverts it if FLIP_U. So the edge we
+ * want is wherever that composed expression reaches 1.
+ */
+function farEdge(halfW, halfD) {
+  const flip = !!cfg.fu;
+  if (cfg.swap) {
+    // Depth is driven by v, i.e. the panel's left-right axis.
+    const x = flip ? -halfW : halfW;
+    return {
+      edge: [new THREE.Vector3(x, 0.003, -halfD), new THREE.Vector3(x, 0.003, halfD)],
+      from: new THREE.Vector3(flip ? halfW : -halfW, 0.004, 0),
+      dir: new THREE.Vector3(flip ? -1 : 1, 0, 0),
+    };
+  }
+  // Depth is driven by u, i.e. toward/away from you. u = 1 at pz = -halfD.
+  const z = flip ? halfD : -halfD;
+  return {
+    edge: [new THREE.Vector3(-halfW, 0.003, z), new THREE.Vector3(halfW, 0.003, z)],
+    from: new THREE.Vector3(0, 0.004, flip ? -halfD : halfD),
+    dir: new THREE.Vector3(0, 0, flip ? 1 : -1),
+  };
+}
+
 function buildPanel() {
   const old = panel;
   if (old) scene.remove(old.group);
@@ -502,16 +534,24 @@ function buildPanel() {
   fill.rotation.x = -Math.PI / 2;
   group.add(fill);
 
-  // Grid: 8 divisions each way.
+  // Metric grid: one cell per GRID_CM of real workspace, so cells stay SQUARE
+  // whatever the workspace aspect, and counting them tells you an actual
+  // distance. The old "8 divisions each way" drew the same count on both
+  // axes, which on a 48 x 15 cm workspace would stretch cells 3:1 and mean
+  // nothing at all.
+  const cell = (GRID_CM / 100) * PANEL_SCALE;
   const gpts = [];
-  const N = 8;
-  for (let i = 0; i <= N; i++) {
-    const fx = -halfW + (w * i) / N;
-    const fz = -halfD + (d * i) / N;
-    gpts.push(new THREE.Vector3(fx, 0.001, -halfD),
-              new THREE.Vector3(fx, 0.001, halfD));
-    gpts.push(new THREE.Vector3(-halfW, 0.001, fz),
-              new THREE.Vector3(halfW, 0.001, fz));
+  for (let x = 0; x <= halfW + 1e-6; x += cell) {
+    for (const sx of (x === 0 ? [0] : [-x, x])) {
+      gpts.push(new THREE.Vector3(sx, 0.001, -halfD),
+                new THREE.Vector3(sx, 0.001, halfD));
+    }
+  }
+  for (let z = 0; z <= halfD + 1e-6; z += cell) {
+    for (const sz of (z === 0 ? [0] : [-z, z])) {
+      gpts.push(new THREE.Vector3(-halfW, 0.001, sz),
+                new THREE.Vector3(halfW, 0.001, sz));
+    }
   }
   group.add(new THREE.LineSegments(
     new THREE.BufferGeometry().setFromPoints(gpts),
@@ -519,6 +559,20 @@ function buildPanel() {
       color: 0x38c0ff, transparent: true, opacity: 0.35,
     }),
   ));
+
+  // Orientation cue: mark the edge that drives the robot to its FURTHEST
+  // reach. The control mapping is transposed and one axis is mirrored
+  // (SWAP_UV / FLIP_U / FLIP_V on the server), which is impossible to infer
+  // from a bare rectangle -- especially now the panel is not square, so you
+  // cannot even see the transpose any more.
+  const far = farEdge(halfW, halfD);
+  group.add(new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(far.edge),
+    new THREE.LineBasicMaterial({ color: 0xff9f0a, linewidth: 2 }),
+  ));
+  const arrow = new THREE.ArrowHelper(
+    far.dir, far.from, Math.min(halfW, halfD) * 0.5, 0xff9f0a, 0.03, 0.02);
+  group.add(arrow);
 
   // Border in the same yellow as the twin's workspace rectangle — it IS that
   // rectangle, scaled up.

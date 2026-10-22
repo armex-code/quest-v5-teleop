@@ -53,9 +53,11 @@ REPO_ROOT = SERVER_DIR.parent
 # echoed to the Quest so the digital twin matches the real arm).
 L1_CM = 20.5
 L2_CM = 30.5
-# 28 x 28 cm square — must match normalized_to_workspace() in v5/main.py.
-# Widened from 21 x 30 on 2026-10-22; see the reach math in that function.
-WORKSPACE = [-14.0, 14.0, 16.0, 44.0]  # arm-frame cm: x_min, x_max, y_min, y_max
+# 48 wide x 15 deep — must match normalized_to_workspace() in v5/main.py.
+# Fitted to the MEASURED joint limits (±128.6° each), not to link lengths:
+# the elbow limit puts the inner boundary at r = 23.9 cm, so a near edge at
+# depth 16–18 (both earlier workspaces) was never actually reachable.
+WORKSPACE = [-24.0, 24.0, 26.0, 41.0]  # arm-frame cm: x_min, x_max, y_min, y_max
 
 VEX_USB_VID = 0x2888          # VEX Robotics
 # Casting/recording on the Quest steals Wi-Fi airtime and makes the pose
@@ -105,7 +107,11 @@ class Bridge:
         try:
             await ws.send(json.dumps({
                 "t": "cfg", "l1": L1_CM, "l2": L2_CM, "ws": WORKSPACE,
-                "swap": int(SWAP_UV),  # client transposes the panel to match
+                # The client needs all three to know which panel edge is the
+                # robot's far reach, and so draws an orientation cue instead
+                # of leaving you to guess whether the mapping is mirrored.
+                "swap": int(SWAP_UV),
+                "fu": int(FLIP_U), "fv": int(FLIP_V),
             }))
             await ws.send(self._status_msg())
             async for raw in ws:
