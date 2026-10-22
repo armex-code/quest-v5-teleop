@@ -93,6 +93,7 @@ let twin = null;
 let twinYaw = THREE.MathUtils.degToRad(TWIN_YAW_DEG);
 let lastTm = null;
 let lastTipPos = null;
+let jawT = 1;          // eased jaw opening, 0 = shut, 1 = open
 let panel = null;      // { group, cursor, halfW, halfD }
 const ctlCards = { left: null, right: null }; // floating button guides
 
@@ -342,41 +343,116 @@ function drawCtlCard(card, title, rows) {
 
 // ── Digital twin ─────────────────────────────────────────────────────────────
 
+// Jaw half-separation at the extremes, in twin metres.
+const JAW_OPEN_Z = 0.015;
+const JAW_SHUT_Z = 0.005;
+
+/**
+ * Flat beam with rounded ends, like a real arm link rather than a bare box:
+ * a 2D outline extruded and laid flat, so it has thickness and bevelled
+ * edges that catch the light.
+ */
+function linkGeometry(len, r0, r1, thick) {
+  const s = new THREE.Shape();
+  s.moveTo(0, r0);
+  s.lineTo(len, r1);
+  s.absarc(len, 0, r1, Math.PI / 2, -Math.PI / 2, true);
+  s.lineTo(0, -r0);
+  s.absarc(0, 0, r0, -Math.PI / 2, Math.PI / 2, true);
+
+  const geo = new THREE.ExtrudeGeometry(s, {
+    depth: thick, bevelEnabled: true, bevelSize: 0.0012,
+    bevelThickness: 0.0012, bevelSegments: 2, curveSegments: 14,
+  });
+  // Extrusion runs along +z; centre it, then tip it so the thickness is
+  // vertical and the beam's width lies in the horizontal plane.
+  geo.translate(0, 0, -thick / 2);
+  geo.rotateX(-Math.PI / 2);
+  return geo;
+}
+
+/** Parallel-jaw gripper. Jaws slide in Z, so they close horizontally. */
+function makeGripper(mat, metal) {
+  const g = new THREE.Group();
+
+  const wrist = new THREE.Mesh(new THREE.CylinderGeometry(0.010, 0.010, 0.016, 16), metal);
+  g.add(wrist);
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.020, 0.013, 0.034), mat);
+  body.position.x = 0.013;
+  g.add(body);
+
+  const jaws = [];
+  for (const side of [-1, 1]) {
+    const jaw = new THREE.Group();
+    const finger = new THREE.Mesh(new THREE.BoxGeometry(0.030, 0.010, 0.007), mat);
+    finger.position.x = 0.021;
+    jaw.add(finger);
+    // Inner pad, so you can see which face actually grips.
+    const pad = new THREE.Mesh(new THREE.BoxGeometry(0.022, 0.011, 0.002), metal);
+    pad.position.set(0.024, 0, -side * 0.0045);
+    jaw.add(pad);
+    jaw.position.z = side * JAW_OPEN_Z;
+    jaw.userData.side = side;
+    g.add(jaw);
+    jaws.push(jaw);
+  }
+  g.userData.jaws = jaws;
+  return g;
+}
+
 function makeArm(solid) {
   // Arm frame → twin local: arm-x → +x, arm-y → −z, joints rotate about +y.
+  // Both joints turn about vertical axes, so the whole assembly — gripper
+  // included — stays parallel to the ground by construction.
   const S = TWIN_SCALE;
   const mat = (color) => new THREE.MeshStandardMaterial(
     solid
-      ? { color, roughness: 0.5 }
-      : { color, transparent: true, opacity: 0.3, depthWrite: false });
+      ? { color, roughness: 0.42, metalness: 0.25 }
+      : { color, transparent: true, opacity: 0.26, depthWrite: false });
+  const metal = mat(solid ? 0x9aa6b4 : 0xc4ccd6);
 
-  const linkMesh = (lenCm, color) => {
-    const m = new THREE.Mesh(
-      new THREE.BoxGeometry(lenCm * S, 0.014, 0.02), mat(color));
-    m.position.x = (lenCm * S) / 2;
-    return m;
-  };
+  const pivot = (r, h) => new THREE.Mesh(
+    // A cylinder on the rotation axis reads as a hinge; a sphere does not.
+    new THREE.CylinderGeometry(r, r, h, 20), metal);
 
   const shoulder = new THREE.Group();
-  shoulder.add(linkMesh(cfg.l1, solid ? 0x3a86ff : 0x9bbcff));
-  shoulder.add(new THREE.Mesh(new THREE.SphereGeometry(0.016, 16, 12),
-    mat(0x8899aa)));
+  const l1 = new THREE.Mesh(
+    linkGeometry(cfg.l1 * S, 0.0145, 0.0115, 0.016),
+    mat(solid ? 0x3a86ff : 0x9bbcff));
+  shoulder.add(l1);
+  shoulder.add(pivot(0.017, 0.026));
 
   const elbow = new THREE.Group();
   elbow.position.x = cfg.l1 * S;
-  elbow.add(linkMesh(cfg.l2, solid ? 0x34c759 : 0xa5e8b8));
-  elbow.add(new THREE.Mesh(new THREE.SphereGeometry(0.013, 16, 12),
-    mat(0x8899aa)));
+  const l2 = new THREE.Mesh(
+    linkGeometry(cfg.l2 * S, 0.0115, 0.0085, 0.013),
+    mat(solid ? 0x34c759 : 0xa5e8b8));
+  elbow.add(l2);
+  elbow.add(pivot(0.0135, 0.022));
   shoulder.add(elbow);
 
   const tip = new THREE.Object3D();
   tip.position.x = cfg.l2 * S;
   elbow.add(tip);
-  const tipMesh = new THREE.Mesh(new THREE.SphereGeometry(0.008, 12, 10),
-    mat(solid ? 0xff3b30 : 0xffb4ae));
-  tip.add(tipMesh);
 
-  return { shoulder, elbow, tip };
+  const gripper = makeGripper(mat(solid ? 0xff6b5a : 0xffb4ae), metal);
+  tip.add(gripper);
+
+  // Where the jaw pads actually meet. The IK positions the WRIST, so this
+  // sits a little further out -- it is what the carry trail should follow,
+  // since that is the point doing the carrying.
+  const grasp = new THREE.Object3D();
+  grasp.position.x = 0.024;
+  gripper.add(grasp);
+
+  return { shoulder, elbow, tip, gripper, grasp };
+}
+
+/** @param {number} t 0 = fully shut, 1 = fully open */
+function setJaws(arm, t) {
+  for (const jaw of arm.gripper.userData.jaws) {
+    jaw.position.z = jaw.userData.side * (JAW_SHUT_Z + t * (JAW_OPEN_Z - JAW_SHUT_Z));
+  }
 }
 
 function buildTwin() {
@@ -456,8 +532,16 @@ function updateTwin() {
   twin.ghost.shoulder.rotation.y = d2r(lastTm.qc[0]);
   twin.ghost.elbow.rotation.y = d2r(lastTm.qc[1]);
 
+  // Jaws. The V5 only reports the commanded open/shut state, not a jaw
+  // angle, so ease toward it rather than snapping -- a hard jump reads as a
+  // glitch, and the real jaws take ~0.7 s to travel anyway.
+  const want = lastTm.grip ? 0 : 1;
+  jawT += (want - jawT) * 0.18;
+  setJaws(twin.solid, jawT);
+  setJaws(twin.ghost, want);
+
   if (lastTm.grip) {
-    twin.solid.tip.getWorldPosition(_tipWorld);
+    twin.solid.grasp.getWorldPosition(_tipWorld);
     const p = twin.group.worldToLocal(_tipWorld.clone());
     p.y = 0.003; // pin the trail just above the plate
     if (!lastTipPos || lastTipPos.distanceTo(p) > 0.0008) {

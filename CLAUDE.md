@@ -142,6 +142,14 @@ Insta360 X5 ──USB──▶ ffmpeg ──rtsp──▶ mediamtx ──whep vi
   TWIN_Q_SIGN / TWIN_YAW_DEG in quest/js/app.js, left stick rotates live.
 - **Angles:** degrees over the wire, arm frame (q1 at shoulder, q2 relative to
   link 1), gear ratio divided out.
+- **Twin:** links are extruded rounded beams, joints are cylinders on the
+  rotation axis, and the end effector is a parallel-jaw gripper whose jaws
+  slide in local Z (so they close horizontally — both joints turn about
+  vertical axes, so the whole assembly is parallel to the ground by
+  construction). The V5 reports only the commanded open/shut state, never a
+  jaw angle, so the solid twin **eases** toward it (`jawT`) while the ghost
+  snaps; a hard jump reads as a glitch. The carry trail follows `grasp` —
+  where the pads meet — not the wrist the IK actually positions.
 - **Rates:** Quest sends ~25 Hz (EMA-smoothed on the Quest). Host acts on the
   **latest** pose only (per-connection `s` sequence numbers). V5 telemetry 20 Hz.
 - **Safe start (do not "helpfully" remove):** the client enters every session
