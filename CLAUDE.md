@@ -52,12 +52,17 @@ serial with V5 on blocks (motors free) → arm follows the hand → twin accurac
   wrong, ask the user to re-measure).
 - Telemetry is the one V5-side addition: `"E,q1,q2,c1,c2\n"` at 20 Hz
   (measured & commanded arm-frame degrees, gear ratio divided out).
-- Motors: shoulder PORT1 (36:1, reversed), elbow PORT4 (18:1), **gripper
-  PORT2 (36:1)** — added 2026-10-22. Gripper travel is **user-measured**:
-  fully open = 0 (the startup pose), fully closed = **-237 motor degrees**.
-  All in `GRIP_*` at the top of `v5/main.py`. Still unconfirmed: the *port*
-  (PORT2 was assumed) and the torque percentages (set conservatively — see
-  below).
+- Motors, **all three ports user-confirmed 2026-10-22**: shoulder **PORT12**
+  (36:1, reversed), elbow **PORT20** (18:1), gripper **PORT11** (36:1).
+  These supersede the PORT1/PORT4 that came from the khatt-bot program — that
+  code predates the current wiring, so don't "restore" it. Gear cartridges are
+  still khatt-bot-derived and were *not* re-confirmed: if a joint runs at the
+  wrong speed, check the cartridge colour (36:1 red, 18:1 green) before
+  touching the control gains.
+- Gripper travel is **user-measured**: fully open = 0 (the startup pose),
+  fully closed = **-237 motor degrees**. All in `GRIP_*` at the top of
+  `v5/main.py`. Still unconfirmed: the torque percentages (set conservatively
+  — see below).
 - Gripper squeeze torque is halved vs an 18:1 build because the 36:1 cartridge
   roughly doubles output torque per percent. Biased gentle on purpose: a weak
   grip drops the object, an overstrong one strips the gripper. Raise

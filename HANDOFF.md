@@ -30,11 +30,16 @@ Gripper specifics (added 2026-10-22, protocol v0.3 renamed `pen` → `grip`
 everywhere; there is no pen actuator and no pen flag any more):
 - Smart motor, all constants in `GRIP_*` at the top of `v5/main.py`. Travel is
   **measured, trust it**: 36:1 cartridge, fully open = 0, fully closed =
-  `GRIP_CLOSED_DEG = -237` motor degrees. Still *unconfirmed*: `GRIP_PORT`
-  (PORT2 was assumed — PORT1 and PORT4 are the arm) and the torque
+  `GRIP_CLOSED_DEG = -237` motor degrees. Still *unconfirmed*: only the torque
   percentages, which are deliberately gentle first-run values. If objects
-  slip, raise `GRIP_TORQUE_PCT`; if the gripper strains, lower it. Don't
-  invent new travel numbers — ask me to re-measure.
+  slip, raise `GRIP_HOLD_TORQUE_PCT` first (symptom: grips cleanly then drops
+  the object ~0.3 s later); if the gripper strains, lower `GRIP_TORQUE_PCT`.
+  Don't invent new travel numbers — ask me to re-measure.
+- **Motor ports are shoulder PORT12, elbow PORT20, gripper PORT11**, all
+  confirmed against the real robot 2026-10-22. The khatt-bot program this was
+  derived from used PORT1/PORT4; that is stale wiring, do not restore it. The
+  gear cartridges are still khatt-bot values and were not re-confirmed — if a
+  joint moves at the wrong speed, suspect the cartridge before the gains.
 - Closing direction is the SIGN of `GRIP_CLOSED_DEG`, not `GRIP_REVERSED`.
   Flipping both cancels out.
 - The startup pose is taken as "fully open" (`reset_position()`), so the V5

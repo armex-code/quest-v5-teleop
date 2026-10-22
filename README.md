@@ -29,10 +29,10 @@ V5 brain itself (`v5/main.py`, deployed once from VEXcode).
 
 - Meta Quest 3S (Meta Quest Browser — WebXR `immersive-ar`)
 - Windows PC (the host) with a USB cable to the V5
-- VEX V5 brain: shoulder motor PORT1 (36:1, reversed), elbow motor PORT4
-  (18:1), **gripper motor PORT2 (36:1)**, external gear ratio 84:12 on the arm,
-  links L1 = 20.5 cm, L2 = 30.5 cm, kill switch on 3-wire port A, reset switch
-  on port B
+- VEX V5 brain: shoulder motor **PORT12** (36:1, reversed), elbow motor
+  **PORT20** (18:1), gripper motor **PORT11** (36:1), external gear ratio
+  84:12 on the arm, links L1 = 20.5 cm, L2 = 30.5 cm, kill switch on 3-wire
+  port A, reset switch on port B
 - Gripper travel is measured: fully open = 0, fully closed = **-237 motor
   degrees**, in the `GRIP_*` constants at the top of `v5/main.py`. Because the
   encoder is zeroed at startup, only that difference matters — always start the
