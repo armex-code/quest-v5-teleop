@@ -44,11 +44,15 @@ const EMA_ALPHA = 0.18;      // pose smoothing (higher = snappier)
 const TWIN_Q_SIGN = -1;      // set to 1 if the twin mirrors the real arm
 const TWIN_YAW_DEG = 90;     // default twin orientation; L-stick adjusts live
 const TWIN_SCALE = 0.006;    // meters per arm-cm → ~31 cm twin for a 51 cm arm
+// Height of the tower the arm is mounted on, in arm-cm. Eyeballed from a
+// photo of the real build — adjust to taste, it is purely cosmetic and does
+// not affect the kinematics.
+const TWIN_BASE_CM = 22;
 // Panel = workspace size x this. Two independent "bigger" knobs, don't
 // confuse them: PANEL_SCALE makes the *hand* area bigger (you move further
 // for the same robot motion, so control gets finer and your arm works
 // harder), while the WORKSPACE in v5/main.py is what the *robot* can reach.
-// With a 28 cm square workspace, 1.8 gives a ~50 cm square panel.
+// With the 48 x 15 cm workspace, 1.8 gives a ~86 x 27 cm panel.
 const PANEL_SCALE = 1.8;
 // Grid cell = this many cm of real workspace, so counting cells is a distance.
 const GRID_CM = 5;
@@ -352,7 +356,7 @@ const JAW_SHUT_Z = 0.005;
  * a 2D outline extruded and laid flat, so it has thickness and bevelled
  * edges that catch the light.
  */
-function linkGeometry(len, r0, r1, thick) {
+function linkGeometry(len, r0, r1, thick, holePitch) {
   const s = new THREE.Shape();
   s.moveTo(0, r0);
   s.lineTo(len, r1);
@@ -360,9 +364,28 @@ function linkGeometry(len, r0, r1, thick) {
   s.lineTo(0, -r0);
   s.absarc(0, 0, r0, -Math.PI / 2, Math.PI / 2, true);
 
+  // Row of holes down the middle, like the slotted channel on the real arm.
+  //
+  // Explicit octagons rather than absarc: absarc inherits curveSegments, so
+  // smooth end caps would also mean 10-segment holes, and the extruded +
+  // bevelled walls of ~23 of those cost 54k vertices for detail about 1 mm
+  // across. Octagons decouple the two and cost a quarter of that.
+  if (holePitch) {
+    for (let x = holePitch; x < len - holePitch * 0.4; x += holePitch) {
+      const pts = [];
+      for (let i = 0; i < 8; i++) {
+        const a = -i / 8 * Math.PI * 2;   // clockwise, so it reads as a hole
+        pts.push(new THREE.Vector2(x + 0.0024 * Math.cos(a), 0.0024 * Math.sin(a)));
+      }
+      const h = new THREE.Path();
+      h.setFromPoints(pts);
+      s.holes.push(h);
+    }
+  }
+
   const geo = new THREE.ExtrudeGeometry(s, {
     depth: thick, bevelEnabled: true, bevelSize: 0.0012,
-    bevelThickness: 0.0012, bevelSegments: 2, curveSegments: 14,
+    bevelThickness: 0.0012, bevelSegments: 1, curveSegments: 12,
   });
   // Extrusion runs along +z; centre it, then tip it so the thickness is
   // vertical and the beam's width lies in the horizontal plane.
@@ -410,25 +433,50 @@ function makeArm(solid) {
       ? { color, roughness: 0.42, metalness: 0.25 }
       : { color, transparent: true, opacity: 0.26, depthWrite: false });
   const metal = mat(solid ? 0x9aa6b4 : 0xc4ccd6);
+  const motorMat = mat(solid ? 0x23262b : 0x6b7078);
+  const gearMat = mat(solid ? 0x6e7681 : 0xaab2bd);
 
   const pivot = (r, h) => new THREE.Mesh(
     // A cylinder on the rotation axis reads as a hinge; a sphere does not.
     new THREE.CylinderGeometry(r, r, h, 20), metal);
 
+  // Motor + gear pair at a joint, echoing the real build: a black cartridge
+  // beside the axis driving a big gear on it. The 84:12 ratio is the whole
+  // reason the arm has the torque it does, so it is worth being able to see.
+  const drive = (gearR, motorScale) => {
+    const g = new THREE.Group();
+    const gear = new THREE.Mesh(
+      new THREE.CylinderGeometry(gearR, gearR, 0.005, 28), gearMat);
+    gear.position.y = 0.014 * motorScale;
+    g.add(gear);
+    const pinion = new THREE.Mesh(
+      new THREE.CylinderGeometry(gearR * (12 / 84), gearR * (12 / 84), 0.005, 14), gearMat);
+    pinion.position.set(-(gearR + gearR * (12 / 84)), 0.014 * motorScale, 0);
+    g.add(pinion);
+    const motor = new THREE.Mesh(
+      new THREE.BoxGeometry(0.030 * motorScale, 0.024 * motorScale, 0.022 * motorScale),
+      motorMat);
+    motor.position.set(-(gearR + gearR * (12 / 84)), 0.030 * motorScale, 0);
+    g.add(motor);
+    return g;
+  };
+
   const shoulder = new THREE.Group();
   const l1 = new THREE.Mesh(
-    linkGeometry(cfg.l1 * S, 0.0145, 0.0115, 0.016),
+    linkGeometry(cfg.l1 * S, 0.0145, 0.0115, 0.016, 0.012),
     mat(solid ? 0x3a86ff : 0x9bbcff));
   shoulder.add(l1);
   shoulder.add(pivot(0.017, 0.026));
+  if (solid) shoulder.add(drive(0.021, 1.0));
 
   const elbow = new THREE.Group();
   elbow.position.x = cfg.l1 * S;
   const l2 = new THREE.Mesh(
-    linkGeometry(cfg.l2 * S, 0.0115, 0.0085, 0.013),
+    linkGeometry(cfg.l2 * S, 0.0115, 0.0085, 0.013, 0.012),
     mat(solid ? 0x34c759 : 0xa5e8b8));
   elbow.add(l2);
   elbow.add(pivot(0.0135, 0.022));
+  if (solid) elbow.add(drive(0.016, 0.8));
   shoulder.add(elbow);
 
   const tip = new THREE.Object3D();
@@ -468,16 +516,36 @@ function buildTwin() {
                      old ? old.group.position.z : -0.55);
   group.rotation.y = twinYaw;
 
-  // Base plate sized to the arm's reach.
-  const reach = (cfg.l1 + cfg.l2 + 3) * S;
-  const plate = new THREE.Mesh(
-    new THREE.CylinderGeometry(reach, reach, 0.004, 48),
-    new THREE.MeshStandardMaterial({
-      color: 0x1b222b, transparent: true, opacity: 0.75, roughness: 0.9,
-    }),
+  // Pedestal. The real arm is not flat on a table -- it sits on top of a
+  // tall tower bolted to a board, so the whole arm sweeps in a plane well
+  // above its base. Drawing it flat made the twin read as a different robot.
+  const towerH = TWIN_BASE_CM * S;
+  const board = new THREE.Mesh(
+    // In arm-cm like everything else here, so it tracks TWIN_SCALE.
+    new THREE.BoxGeometry(26 * S, 0.006, 20 * S),
+    new THREE.MeshStandardMaterial({ color: 0xc9a227, roughness: 0.85 }),
   );
-  plate.position.y = -0.004;
-  group.add(plate);
+  board.position.y = -towerH;
+  group.add(board);
+
+  // Four splayed uprights, like the real A-frame.
+  const legMat = new THREE.MeshStandardMaterial({ color: 0x7a5c3a, roughness: 0.7 });
+  for (const sx of [-1, 1]) {
+    for (const sz of [-1, 1]) {
+      const leg = new THREE.Mesh(new THREE.BoxGeometry(0.010, towerH, 0.010), legMat);
+      leg.position.set(sx * 0.022, -towerH / 2, sz * 0.022);
+      // Splay outward toward the board so it reads as a tripod, not a box.
+      leg.rotation.z = sx * 0.13;
+      leg.rotation.x = -sz * 0.13;
+      group.add(leg);
+    }
+  }
+  const collar = new THREE.Mesh(
+    new THREE.BoxGeometry(0.062, 0.012, 0.062),
+    new THREE.MeshStandardMaterial({ color: 0x7a5c3a, roughness: 0.7 }),
+  );
+  collar.position.y = -0.016;
+  group.add(collar);
 
   // Workspace rectangle. cfg.ws is [lat_min, lat_max, fwd_min, fwd_max] in cm;
   // in the V5's IK frame forward is +x and lateral is +y.
