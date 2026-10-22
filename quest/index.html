@@ -14,6 +14,12 @@
              border: none; background: #2f81f7; color: white; cursor: pointer; }
     #start:disabled { background: #444c56; cursor: default; }
     #status { max-width: 34rem; opacity: 0.85; }
+    #modes { display: flex; gap: 0.6rem; }
+    #modes a { display: block; padding: 0.6rem 1.4rem; border-radius: 10px;
+               border: 1px solid #39414b; background: #1b222b; color: #e8edf2;
+               text-decoration: none; font-size: 1rem; }
+    #modes a.on { background: #2f81f7; border-color: #2f81f7; color: #fff; }
+    #modenote { max-width: 34rem; opacity: 0.6; font-size: 0.85rem; }
     /* dom-overlay HUD shown inside AR (when the browser grants dom-overlay) */
     #overlay { position: fixed; inset: 0; pointer-events: none; }
     #readout { position: absolute; top: 2rem; left: 2rem; white-space: pre;
@@ -28,6 +34,10 @@
 <body>
   <div id="panel">
     <h1>V5 Arm Teleop</h1>
+    <div id="modes">
+      <a id="mode-ar" href="?mode=ar">Passthrough (AR)</a>
+      <a id="mode-vr" href="?mode=vr">Live 360 camera</a>
+    </div>
     <button id="start" disabled>Enter AR</button>
     <p id="status">Checking WebXR support…</p>
     <p style="max-width:34rem;opacity:.7;font-size:.9rem">
@@ -36,6 +46,13 @@
       panel to your hand, <b>X</b> pauses. <b>Left grip</b> grabs the digital
       twin, <b>left stick</b> rotates it, <b>right stick click</b> clears the
       trail.
+    </p>
+    <p id="modenote">
+      Use AR when you are in the room with the robot — sharper, in stereo, no
+      camera needed. The 360 mode puts you inside the Insta360 feed for
+      operating from elsewhere, and needs <code>start_camera.ps1</code>
+      running too. You can also switch with <b>Y</b> on the left controller
+      without taking the headset off.
     </p>
   </div>
   <div id="overlay"><div id="readout"></div></div>

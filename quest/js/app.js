@@ -9,7 +9,28 @@
 //   X (left)        = pause / resume (arm and gripper both hold as-is)
 //   LEFT grip hold  = carry the digital twin
 //   LEFT stick ◄ ►  = rotate the twin to match the real robot on the table
+//
+// Two worlds, switchable INSIDE the session with Y — no reload, no dropping
+// out of VR:
+//   passthrough  you are in the room with the robot
+//   360 camera   a live Insta360 feed surrounds you, for operating remotely
+//
+// Both run in a single `immersive-ar` session. A headset cannot change session
+// type in place, so instead of ending and restarting one (which dumps you back
+// to the browser), we always request AR and simply show or hide an opaque
+// sphere: opaque geometry covers passthrough completely, which is all "VR
+// mode" ever actually meant here. Toggling is one visible flag.
+//
+// ?mode= only chooses which world you START in.
 import * as THREE from 'three';
+import { Pano } from './pano.js';
+import { ControllerModel } from './controllers.js';
+
+const params = new URLSearchParams(location.search);
+const START_MODE = params.get('mode') === 'vr' ? 'vr' : 'ar';
+const XR_MODE = 'immersive-ar';
+let pano = null;
+let panoShown = false;   // live state; starts from START_MODE on entry
 
 const startBtn = document.getElementById('start');
 const statusEl = document.getElementById('status');
@@ -23,7 +44,12 @@ const EMA_ALPHA = 0.18;      // pose smoothing (higher = snappier)
 const TWIN_Q_SIGN = -1;      // set to 1 if the twin mirrors the real arm
 const TWIN_YAW_DEG = 90;     // default twin orientation; L-stick adjusts live
 const TWIN_SCALE = 0.006;    // meters per arm-cm → ~31 cm twin for a 51 cm arm
-const PANEL_SCALE = 1.5;     // drawing panel = workspace size × this factor
+// Panel = workspace size x this. Two independent "bigger" knobs, don't
+// confuse them: PANEL_SCALE makes the *hand* area bigger (you move further
+// for the same robot motion, so control gets finer and your arm works
+// harder), while the WORKSPACE in v5/main.py is what the *robot* can reach.
+// With a 28 cm square workspace, 1.8 gives a ~50 cm square panel.
+const PANEL_SCALE = 1.8;
 const PANEL_POS = [0, 1.0, -0.45]; // default panel spot (relative to start)
 const TRAIL_MAX = 4000;      // points
 
@@ -31,6 +57,7 @@ let renderer, scene, camera;
 let hudCanvas, hudCtx, hudTexture;
 let lastHudDraw = 0;
 const markers = { left: null, right: null };
+const ctlModels = { left: null, right: null };
 const prevButtons = { left: {}, right: {} };
 
 // Arm geometry (cm) — defaults match v5/main.py; overwritten by "cfg" msg.
@@ -51,7 +78,13 @@ let lastSend = 0;
 let ema = null;        // smoothed {x, z} of the right controller
 let lastUV = null;
 let gripNow = false;
-let paused = false;    // X button: freeze the arm (server holds pos + grip)
+// SAFE START: begin held, never live on entry. Walking into a session with
+// the arm already chasing your hand is how you get a surprise lunge — the
+// panel lands wherever you happen to be standing and the arm snaps to it.
+// Paused withholds u,v entirely, so the server never gets a pose to act on
+// and no serial frame is sent at all until you deliberately go live.
+let paused = true;
+let armed = false;     // false until the first unpause — changes the HUD copy
 
 // Scene objects
 let twin = null;
@@ -61,6 +94,9 @@ let lastTipPos = null;
 let panel = null;      // { group, cursor, halfW, halfD }
 const ctlCards = { left: null, right: null }; // floating button guides
 
+// Guarded: this runs at module top level, so a missing element would throw
+// and take the whole client down before checkSupport() ever runs.
+document.getElementById('mode-' + START_MODE)?.classList.add('on');
 checkSupport();
 connectWS();
 
@@ -116,22 +152,24 @@ async function checkSupport() {
     setStatus('navigator.xr is missing — open this page in the Meta Quest Browser.');
     return;
   }
-  const supported = await navigator.xr.isSessionSupported('immersive-ar');
+  const supported = await navigator.xr.isSessionSupported(XR_MODE);
   if (!supported) {
-    setStatus('immersive-ar not supported on this device/browser.');
+    setStatus(`${XR_MODE} not supported on this device/browser.`);
     return;
   }
-  setStatus('Ready. Put the headset on and tap Enter AR.');
+  startBtn.textContent = 'Enter';
+  setStatus('Ready. Put the headset on and tap Enter. '
+    + 'Y on the left controller swaps between passthrough and the 360 camera.');
   startBtn.disabled = false;
   startBtn.addEventListener('click', enterAR);
 }
 
 async function enterAR() {
   startBtn.disabled = true;
-  setStatus('Requesting AR session…');
+  setStatus(`Requesting ${XR_MODE} session…`);
   let session;
   try {
-    session = await navigator.xr.requestSession('immersive-ar', {
+    session = await navigator.xr.requestSession(XR_MODE, {
       requiredFeatures: ['local-floor'],
       optionalFeatures: ['dom-overlay'],
       domOverlay: { root: overlayRoot },
@@ -145,14 +183,36 @@ async function enterAR() {
   if (!renderer) initScene();
   readoutEl.style.display = 'block';
   renderer.xr.setReferenceSpaceType('local-floor');
+  pano.applyRendererSettings(renderer); // must precede setSession
+  setWorld(START_MODE === 'vr');
   await renderer.xr.setSession(session);
   session.addEventListener('end', onSessionEnd);
   renderer.setAnimationLoop(onFrame);
 }
 
+/**
+ * Show or hide the 360 world. Instant — no session teardown, no reload, you
+ * never leave the headset view.
+ *
+ * The WHEP connection is made lazily on first show and then kept, so staying
+ * in passthrough costs no bandwidth, and flipping back and forth afterwards
+ * does not re-handshake.
+ */
+function setWorld(showPano) {
+  panoShown = showPano;
+  pano.mesh.visible = showPano;
+  if (showPano && pano.status === 'idle') pano.connect();
+}
+
+function toggleWorld() { setWorld(!panoShown); }
+
 function initScene() {
   scene = new THREE.Scene();
-  camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.01, 50);
+  // Far plane must clear the panorama sphere (radius 500) or it is clipped
+  // away entirely. Harmless for the close-up scene: with near = 0.01 the
+  // depth resolution at 1 m is still ~6 micrometres, far finer than the
+  // ~1 mm offsets the twin and panel rely on.
+  camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.01, 2000);
   scene.add(camera); // required so HUD children of the camera render
 
   renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -163,6 +223,16 @@ function initScene() {
 
   const light = new THREE.HemisphereLight(0xffffff, 0x445566, 2.4);
   scene.add(light);
+
+  // Always built, shown only on demand. Construction is cheap (one sphere)
+  // and no WHEP handshake happens until the 360 world is first shown.
+  pano = new Pano(scene, {
+    radius: parseFloat(params.get('radius')) || undefined,
+    fbScale: parseFloat(params.get('fbscale')) || undefined,
+    yawDeg: parseFloat(params.get('yaw')) || 0,
+    rollDeg: parseFloat(params.get('roll')) || 0,
+  });
+  pano.mesh.visible = false;
 
   // In-scene HUD: canvas texture on a plane 0.65 m in front of the camera.
   hudCanvas = document.createElement('canvas');
@@ -177,15 +247,23 @@ function initScene() {
   hudMesh.position.set(0, -0.16, -0.65);
   camera.add(hudMesh);
 
-  // One sphere per controller; red while its trigger is held.
+  // One sphere per controller at the *pointer* tip; red while trigger held.
   for (const hand of ['left', 'right']) {
     const m = new THREE.Mesh(
-      new THREE.SphereGeometry(0.02, 16, 12),
+      new THREE.SphereGeometry(0.012, 16, 12),
       new THREE.MeshBasicMaterial(),
     );
     m.visible = false;
     scene.add(m);
     markers[hand] = m;
+  }
+
+  // Plus the real Meta Touch Plus mesh at the *grip* pose, with a pip on each
+  // button so the names on the floating card map onto something you can see.
+  for (const hand of ['left', 'right']) {
+    const model = new ControllerModel(hand);
+    scene.add(model.group);
+    ctlModels[hand] = model;
   }
 
   buildTwin();
@@ -213,9 +291,17 @@ function makeCtlCard() {
 
 // rows: [buttonName, action, isPressed]
 function drawCtlCard(card, title, rows) {
-  const key = title + rows.map((r) => r[2] ? 1 : 0).join('');
+  const key = title + rows.length + rows.map((r) => r[2] ? 1 : 0).join('');
   if (key === card.lastKey) return;
   card.lastKey = key;
+
+  // Grow the canvas to fit — VR mode adds two 360-camera rows, and the
+  // original fixed 340 px only had room for three.
+  const needH = 100 + rows.length * 78 - 10;
+  if (card.canvas.height !== needH) {
+    card.canvas.height = needH;
+    card.sp.scale.set(0.15, 0.15 * needH / card.canvas.width, 1);
+  }
 
   const ctx = card.ctx;
   const W = card.canvas.width, H = card.canvas.height;
@@ -525,6 +611,8 @@ function onFrame(time, frame) {
     const ref = renderer.xr.getReferenceSpace();
     markers.left.visible = false;
     markers.right.visible = false;
+    if (ctlModels.left) ctlModels.left.group.visible = false;
+    if (ctlModels.right) ctlModels.right.group.visible = false;
     if (ctlCards.left) ctlCards.left.sp.visible = false;
     if (ctlCards.right) ctlCards.right.sp.visible = false;
 
@@ -546,26 +634,57 @@ function onFrame(time, frame) {
       marker.material.color.setHex(
         trigger ? 0xff3b30 : hand === 'right' ? 0x34c759 : 0x3a86ff);
 
+      // The body belongs at the GRIP pose, not the target-ray pose — they are
+      // different transforms, and using the ray one puts the model out in
+      // front of your hand at a tilt.
+      const model = ctlModels[hand];
+      if (model && model.ready && src.gripSpace) {
+        const gp = frame.getPose(src.gripSpace, ref);
+        if (gp) {
+          model.setFromPose(gp.transform);
+          model.group.visible = true;
+          model.update(btn);
+        }
+      }
+
       if (hand === 'right') {
         rightSeen = true;
         updateRightCursor(p.x, p.z, trigger, time);
         if (risingEdge('right', 4, btn(4))) movePanelTo(p.x, p.y, p.z); // A
         if (risingEdge('right', 3, btn(3))) clearTrail(); // stick click
 
+        // 360-camera controls, only while that world is actually showing —
+        // otherwise they would silently swallow the right stick in passthrough.
+        let zoomY = 0;
+        if (panoShown) {
+          if (risingEdge('right', 5, btn(5))) pano.recenter(renderer.xr.getCamera()); // B
+          zoomY = gp.axes[3] || 0;
+          if (Math.abs(zoomY) > 0.3) pano.adjustZoom(-zoomY * 0.02);
+        }
+
         const card = ctlCards.right;
         if (card) {
           card.sp.position.set(p.x, p.y + 0.11, p.z);
           card.sp.visible = true;
-          drawCtlCard(card, 'RIGHT — the gripper', [
+          const rows = [
             ['Trigger', gripNow ? 'GRIPPING' : 'close gripper', trigger],
             ['A', 'move panel here', btn(4)],
             ['Stick press', 'clear trail', btn(3)],
-          ]);
+          ];
+          if (panoShown) {
+            rows.push(['B', 'recentre 360 view', btn(5)]);
+            rows.push(['Stick ▲ ▼', 'zoom 360', Math.abs(zoomY) > 0.3]);
+          }
+          drawCtlCard(card, 'RIGHT — the gripper', rows);
         }
       }
 
       if (hand === 'left') {
-        if (risingEdge('left', 4, btn(4))) paused = !paused; // X → pause/resume
+        if (risingEdge('left', 4, btn(4))) { // X → pause/resume
+          paused = !paused;
+          if (!paused) armed = true;
+        }
+        if (risingEdge('left', 5, btn(5))) toggleWorld(); // Y → passthrough <-> 360
         if (btn(1) && twin) { // grip held → carry the twin
           twin.group.position.set(p.x, p.y, p.z);
         }
@@ -581,7 +700,8 @@ function onFrame(time, frame) {
           card.sp.position.set(p.x, p.y + 0.11, p.z);
           card.sp.visible = true;
           drawCtlCard(card, 'LEFT — the twin', [
-            ['X', paused ? 'resume' : 'pause', btn(4)],
+            ['X', paused ? 'GO LIVE' : 'pause', btn(4)],
+            ['Y', panoShown ? 'back to passthrough' : 'show 360 camera', btn(5)],
             ['Grip (hold)', 'move twin', btn(1)],
             ['Stick ◄ ►', 'rotate twin', Math.abs(ax) > 0.5],
           ]);
@@ -592,6 +712,7 @@ function onFrame(time, frame) {
 
   updateTwin();
   updatePanelCursor();
+  if (pano) pano.update(renderer.xr.getCamera());
 
   if (time - lastHudDraw > HUD_REDRAW_MS) {
     drawHud(buildHudModel(rightSeen));
@@ -621,6 +742,14 @@ function buildHudModel(rightSeen) {
   } else if (!rightSeen) {
     m.step = 'WAKE THE RIGHT CONTROLLER';
     m.lines = ['Press any button on it.'];
+  } else if (paused && !armed) {
+    m.paused = true;
+    m.step = 'SAFE START — ARM IS HELD';
+    m.lines = [
+      'The arm will NOT move until you go live.',
+      'Point the blue panel where you want it (A on the right',
+      'controller moves it to your hand), then press X to go live.',
+    ];
   } else if (paused) {
     m.paused = true;
     m.step = 'PAUSED — ARM AND GRIP HOLDING';
@@ -659,7 +788,11 @@ function drawHud(m) {
   };
   chip(48, 'PC', m.wsOk, 'connected', 'offline');
   chip(430, 'ROBOT', m.v5Ok, 'connected', 'offline');
-  if (m.live) {
+  if (panoShown) {
+    // A black world is almost always the camera half not running, so say so
+    // here rather than leaving you guessing inside the headset.
+    chip(830, 'CAM', pano.status === 'live', 'live', pano.status);
+  } else if (m.live) {
     ctx.beginPath();
     ctx.arc(830, 52, 13, 0, Math.PI * 2);
     ctx.fillStyle = m.grip ? '#ff453a' : '#8e8e93';

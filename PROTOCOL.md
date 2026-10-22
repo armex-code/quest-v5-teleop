@@ -1,11 +1,17 @@
-# Wire Protocol — v0.3
+# Wire Protocol — v0.4
 
+> **v0.4 (additive, nothing breaks):** an optional third link carries a live
+> 360 camera feed to the headset for remote operation (`?mode=vr`). It is a
+> one-way video path with no robot data on it, so v0.3 clients keep working
+> unchanged — a host without the camera running simply answers 404 and the
+> page falls back to reporting the camera offline.
+>
 > **v0.3 breaking change:** the `pen` field is renamed `grip` everywhere (`p`
 > and `tm` messages, and the serial frame) now that a smart-motor gripper is
 > fitted as the end effector. `1` = closed, `0` = open. The stale-pose rule
 > changed with it — see *Reliability rules*.
 
-Two links, both carrying compact line/frame-oriented messages:
+Three links, two of them carrying compact line/frame-oriented messages:
 
 1. **Quest ↔ host** — WebSocket over TLS (`wss://<host-ip>:8765`), one compact
    JSON object per text frame. Keys are short; every message has `"t"` (type).
@@ -13,6 +19,8 @@ Two links, both carrying compact line/frame-oriented messages:
    normally; a Raspberry Pi works identically).
 2. **Host ↔ V5 brain** — USB serial, 115200 baud, one ASCII line per frame.
    The IK runs **on the V5** (`v5/main.py`); the host only forwards.
+3. **Host → Quest video** — WebRTC, signalled over HTTPS (*optional*, only in
+   `?mode=vr`). See *360 camera link* below.
 
 Numbers: positions in **meters** (raw Quest space) or unitless `[0,1]`
 (calibrated), angles in **degrees**, lengths in **cm**, timestamps in ms
@@ -115,6 +123,49 @@ E,<q1>,<q2>,<c1>,<c2>\n     e.g.  E,34.20,-71.90,35.00,-70.50
 commanded target ÷ gear ratio. Any serial line not starting with `E,` is
 treated as V5 debug output and logged, never parsed.
 
+## 360 camera link (optional, `?mode=vr` only)
+
+A one-way video path so the operator can work from another room. It carries
+**no robot data** and is completely independent of the two links above: with
+the camera half stopped, `?mode=ar` is unaffected and `?mode=vr` just reports
+the camera offline.
+
+```
+Insta360 X5 ──USB──▶ ffmpeg ──RTSP/loopback──▶ MediaMTX ──WHEP──▶ run.py ──WebRTC──▶ Quest
+            equirect         NVENC H.264                        (signalling)   (UDP :8189)
+            2880x1440p30     no transcode
+```
+
+### Signalling — `POST /whep` on the **page's own port** (8443)
+
+Body is an SDP offer (`Content-Type: application/sdp`); the reply is `201`
+with the SDP answer and a `Location` header naming the session, which the
+client `DELETE`s on teardown. `run.py` reverse-proxies this to MediaMTX on
+`127.0.0.1:8889`.
+
+That proxy is not decoration. If MediaMTX terminated its own TLS, the page
+(:8443) and the WHEP endpoint (:8889) would be separate origins with separate
+self-signed certs — and a cross-origin `fetch()` to an untrusted cert fails
+outright, with no interstitial to click. Inside a headset there is no way to
+accept that second cert. Proxying collapses it to one cert on one port.
+
+| endpoint | method | meaning |
+|---|---|---|
+| `/whep` | POST | SDP offer in, SDP answer out, `Location: /whep/<id>` |
+| `/whep/<id>` | DELETE | end the session (best effort; DTLS teardown also reaps it) |
+
+### Media
+
+Only *signalling* goes through `run.py`. The video itself is UDP straight from
+MediaMTX **:8189** to the headset, so the proxy costs nothing in latency — but
+that port must be open in the firewall or the page loads and the world stays
+black. `start_camera.ps1 -AddFirewallRules` opens it.
+
+Stream: H.264, 2880×1440 @ 30 fps, equirectangular 2:1, limited-range bt709,
+no B-frames, 1 keyframe/s. Constrained Baseline by default because MediaMTX
+echoes the browser's offered `profile-level-id` without checking it against
+what is actually being sent.
+
 ## Reliability rules
 
 - Latest-wins everywhere: both sides keep only the newest message of each
@@ -129,3 +180,7 @@ treated as V5 debug output and logged, never parsed.
   but opening a gripper would drop whatever it is carrying. Nothing in the
   stack ever opens the jaws on its own — only a released trigger does.
 - If the V5 serial link drops, the host retries every 2 s and reports via `st`.
+- The 360 feed is best-effort and never gates control: if WHEP fails or the
+  stream stalls, the client retries every 2 s and the HUD's `CAM` chip shows
+  the state. Losing video does **not** stop or alter pose streaming — the arm
+  keeps obeying the controller exactly as in `?mode=ar`.

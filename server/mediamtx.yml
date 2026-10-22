@@ -1,0 +1,85 @@
+# MediaMTX config for Live360.
+#
+# Job: accept one already-encoded H.264 stream from ffmpeg over loopback RTSP,
+# republish it as WebRTC/WHEP. No transcoding happens here -- ffmpeg hands over
+# NVENC output and MediaMTX only repackages it, which is why the added latency
+# is single-digit milliseconds.
+#
+# Both HTTP listeners are bound to loopback on purpose: serve.py reverse-proxies
+# WHEP signalling so the headset deals with exactly one TLS certificate on one
+# port. See the comment at the top of serve.py for why that matters.
+#
+# Key names verified against the reference config shipped with v1.21.2.
+
+logLevel: info
+logDestinations: [stdout]
+
+readTimeout: 10s
+writeTimeout: 10s
+writeQueueSize: 512
+
+authInternalUsers:
+  # Local processes (ffmpeg publishing, serve.py proxying reads) get everything.
+  - user: any
+    pass:
+    ips: ["127.0.0.1", "::1"]
+    permissions:
+      - action: publish
+      - action: read
+      - action: api
+  # Nothing else can reach these ports anyway, but deny publish explicitly so a
+  # future decision to expose the port cannot turn into an open relay.
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: read
+
+api: false
+metrics: false
+pprof: false
+playback: false
+
+# ---------------------------------------------------------------- ingest ----
+# ffmpeg pushes here. TCP only: we are on loopback, so there is no packet loss
+# to route around, and TCP avoids any UDP buffer tuning.
+rtsp: true
+rtspTransports: [tcp]
+rtspAddress: 127.0.0.1:8554
+rtspEncryption: "no"
+
+# Unused protocols, off. Each one is a listening socket we would otherwise have
+# to reason about. MoQ in particular defaults to ON in v1.21 and will generate
+# auto.crt/auto.key in the working directory if you leave it enabled.
+rtmp: false
+hls: false
+srt: false
+moq: false
+
+# ----------------------------------------------------------------- egress ----
+webrtc: true
+# Loopback only -- serve.py proxies to this. TLS is terminated by serve.py.
+webrtcAddress: 127.0.0.1:8889
+webrtcEncryption: false
+webrtcAllowOrigins: ["*"]
+
+# This one IS exposed on the LAN, and must be: it carries the actual media as
+# UDP straight to the headset, bypassing the proxy. Windows Firewall will block
+# it until you run `start.ps1 -AddFirewallRules` once as administrator.
+webrtcLocalUDPAddress: :8189
+
+# Advertise every local interface as an ICE candidate so the hotspot address is
+# included without hardcoding it. Extra candidates from virtual adapters (Meta
+# Virtual Monitor, etc.) are harmless -- ICE checks them in parallel and the
+# reachable one wins. If connection setup ever feels slow, pin the right one
+# with webrtcIPsFromInterfacesList: ["Local Area Connection* 12"].
+webrtcIPsFromInterfaces: true
+
+# No STUN/TURN. Everything is on one LAN, so host candidates are sufficient --
+# and an empty list means no internet dependency and no 5s gather timeout.
+webrtcICEServers2: []
+webrtcSTUNGatherTimeout: 1s
+
+paths:
+  cam:
+    source: publisher

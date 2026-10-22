@@ -5,12 +5,17 @@ Runs three things in one process (host = the Windows PC, or a Pi — anything
 on the same network as the Quest with a USB cable to the V5 brain):
 
   1. HTTPS static server for quest/           (default port 8443)
+     ...which also proxies WHEP signalling for the 360 camera (?mode=vr)
   2. WSS WebSocket bridge for pose/telemetry  (default port 8765)
   3. USB serial link to the VEX V5 brain      (auto-detected, 115200 baud)
 
 Data flow (see PROTOCOL.md):
   Quest "p" msg (u,v,grip) --> serial "u,v,grip\\n" --> V5 (IK runs ON the brain)
   V5 "E,q1,q2,c1,c2\\n"    --> WSS "tm" msg        --> Quest digital twin
+
+The 360 camera is optional and entirely separate: start_camera.ps1 runs
+MediaMTX + ffmpeg, and this server only relays the SDP handshake. Without it,
+?mode=ar (the default, passthrough) is unaffected.
 
 The server runs fine with no V5 attached (it keeps retrying every 2 s and
 tells the Quest via "st" messages) so the twin/UI can be tested standalone.
@@ -28,6 +33,8 @@ import ssl
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -46,7 +53,9 @@ REPO_ROOT = SERVER_DIR.parent
 # echoed to the Quest so the digital twin matches the real arm).
 L1_CM = 20.5
 L2_CM = 30.5
-WORKSPACE = [-10.5, 10.5, 18.0, 48.0]  # arm-frame cm: x_min, x_max, y_min, y_max
+# 28 x 28 cm square — must match normalized_to_workspace() in v5/main.py.
+# Widened from 21 x 30 on 2026-10-22; see the reach math in that function.
+WORKSPACE = [-14.0, 14.0, 16.0, 44.0]  # arm-frame cm: x_min, x_max, y_min, y_max
 
 VEX_USB_VID = 0x2888          # VEX Robotics
 # Casting/recording on the Quest steals Wi-Fi airtime and makes the pose
@@ -282,6 +291,91 @@ class Bridge:
                 lu, lv = su, sv
 
 
+class QuestHandler(SimpleHTTPRequestHandler):
+    """Static files for quest/, plus WHEP signalling for the 360 camera.
+
+    The WHEP proxy only matters in `?mode=vr`, where the page shows a live
+    360 camera feed instead of passthrough (see PROTOCOL.md). It forwards SDP
+    to MediaMTX on loopback, and exists purely so the headset deals with ONE
+    certificate on ONE port: if MediaMTX terminated its own TLS, the page
+    (:8443) and the WHEP endpoint would be different origins with different
+    self-signed certs, and a cross-origin fetch to an untrusted cert fails
+    outright with no interstitial to accept. There is no way to click through
+    that inside a headset.
+
+    Only signalling passes through here. The video itself goes as UDP straight
+    from MediaMTX to the Quest, so this costs nothing in latency.
+    """
+
+    # Some Windows installs map .js to text/plain in the registry, which makes
+    # the browser refuse every ES module. extensions_map wins over mimetypes.
+    extensions_map = {
+        **SimpleHTTPRequestHandler.extensions_map,
+        ".js": "text/javascript",
+        ".mjs": "text/javascript",
+        ".html": "text/html",
+        ".css": "text/css",
+    }
+
+    mediamtx = "http://127.0.0.1:8889"
+    stream_path = "cam"
+
+    def _send_bytes(self, status, body, ctype, extra=None):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _upstream(self, path, method, body, ctype):
+        req = urllib.request.Request(f"{self.mediamtx}{path}", data=body,
+                                     method=method)
+        if ctype:
+            req.add_header("Content-Type", ctype)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                status, payload = r.status, r.read()
+                location = r.headers.get("Location")
+                resp_ctype = r.headers.get("Content-Type", "application/sdp")
+        except urllib.error.HTTPError as e:
+            detail = (e.read() or b"").decode("utf-8", "replace").strip()
+            if e.code == 404:
+                detail = detail or (
+                    f"nothing is publishing to '{self.stream_path}' — "
+                    "is start_camera.ps1 running?")
+            self._send_bytes(e.code, detail.encode(), "text/plain")
+            return
+        except urllib.error.URLError as e:
+            self._send_bytes(502, (
+                f"cannot reach MediaMTX at {self.mediamtx}: {e.reason} — "
+                "is start_camera.ps1 running?").encode(), "text/plain")
+            return
+
+        extra = {}
+        if location:
+            # Re-point the session URL at us so teardown comes back here.
+            extra["Location"] = "/whep/" + location.rsplit("/whep/", 1)[-1]
+        self._send_bytes(status, payload, resp_ctype, extra)
+
+    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler naming
+        if self.path.rstrip("/") != "/whep":
+            self.send_error(404, "not found")
+            return
+        n = int(self.headers.get("Content-Length") or 0)
+        offer = self.rfile.read(n) if n else b""
+        self._upstream(f"/{self.stream_path}/whep", "POST", offer,
+                       self.headers.get("Content-Type", "application/sdp"))
+
+    def do_DELETE(self):  # noqa: N802
+        if not self.path.startswith("/whep/"):
+            self.send_error(404, "not found")
+            return
+        self._upstream(f"/{self.stream_path}/whep/{self.path[len('/whep/'):]}",
+                       "DELETE", None, None)
+
+
 def make_ssl_context(cert, key):
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
@@ -289,7 +383,7 @@ def make_ssl_context(cert, key):
 
 
 def start_static_server(port, directory, cert, key):
-    handler = partial(SimpleHTTPRequestHandler, directory=directory)
+    handler = partial(QuestHandler, directory=directory)
     httpd = ThreadingHTTPServer(("0.0.0.0", port), handler)
     httpd.socket = make_ssl_context(cert, key).wrap_socket(
         httpd.socket, server_side=True)
@@ -336,8 +430,15 @@ def main():
                     help="run without the V5 (UI / twin testing)")
     ap.add_argument("--no-static", action="store_true",
                     help="don't serve quest/ (if another server does)")
+    ap.add_argument("--mediamtx", default="http://127.0.0.1:8889",
+                    help="MediaMTX HTTP base for WHEP signalling (?mode=vr)")
+    ap.add_argument("--stream", default="cam",
+                    help="MediaMTX path name for the 360 camera")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+
+    QuestHandler.mediamtx = args.mediamtx.rstrip("/")
+    QuestHandler.stream_path = args.stream
 
     for f in (args.cert, args.key):
         if not Path(f).exists():

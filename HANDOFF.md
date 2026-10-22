@@ -4,7 +4,7 @@
 > changes. Usage: start a new Claude Code session in this directory, run
 > `/model sonnet` (or `haiku`), and paste everything below the line.
 >
-> Last regenerated 2026-10-22 (gripper end effector added, M6).
+> Last regenerated 2026-10-22 (360 camera world merged in, M7).
 
 ---
 
@@ -35,7 +35,7 @@ everywhere; there is no pen actuator and no pen flag any more):
   slip, raise `GRIP_HOLD_TORQUE_PCT` first (symptom: grips cleanly then drops
   the object ~0.3 s later); if the gripper strains, lower `GRIP_TORQUE_PCT`.
   Don't invent new travel numbers — ask me to re-measure.
-- **Motor ports are shoulder PORT12, elbow PORT20, gripper PORT11**, all
+- **Motor ports are shoulder PORT11, elbow PORT20, gripper PORT12**, all
   confirmed against the real robot 2026-10-22. The khatt-bot program this was
   derived from used PORT1/PORT4; that is stale wiring, do not restore it. The
   gear cartridges are still khatt-bot values and were not re-confirmed — if a
@@ -52,12 +52,44 @@ everywhere; there is no pen actuator and no pen flag any more):
   withholds `u,v` so the last grip is held, and the kill switch uses
   `stop(HOLD)`. A dropped connection must never become a dropped object.
 
-Current state (2026-10-22): **everything is built, NOTHING is
-hardware-confirmed yet.** My next step is the first end-to-end test, in this
-order: (1) page loads + AR session on the Quest, (2) WS connects
+The 360 camera world (M7, merged 2026-10-22). Optional, off by default, and
+it carries **no robot data** — if it breaks, control is unaffected:
+- The page takes `?mode=ar` (default, passthrough — what everything above
+  describes) or `?mode=vr` (a live Insta360 X5 feed as the world). Panel,
+  twin, HUD and controls are identical in both. Only one immersive session can
+  run at a time and an opaque sphere covers passthrough, so it is a choice.
+- Camera half is `start_camera.ps1` (mediamtx + ffmpeg); the page and the WHEP
+  signalling stay in `run.py`. Code is confined to `quest/js/pano.js` +
+  `quest/js/whep.js`; `app.js` only picks the session type.
+- **The camera pipeline IS hardware-confirmed** (capture → encode → WebRTC,
+  2880×1440p30, 0 dropped frames). What is NOT confirmed is the merged page
+  in the headset.
+- Facts already measured — don't re-litigate them:
+  - 2880×1440 is the X5's live ceiling ≈ 8 px/degree vs the headset's ~20.
+    Our H.264 at 35 Mbit is transparent (47.4 dB PSNR) and Wi-Fi drops zero
+    frames, so **neither encoding nor network is the bottleneck** — the camera
+    downsamples 8K internally. Raising bitrate does nothing.
+  - Monoscopic forever: the X5's lenses are back to back, no stereo baseline.
+  - WHEP is proxied through run.py's own port so the headset trusts ONE cert;
+    a cross-origin fetch to a second self-signed cert fails with no
+    interstitial to accept.
+  - Black world + `CAM live` on the HUD = UDP 8189 blocked
+    (`start_camera.ps1 -AddFirewallRules`, as administrator).
+  - In `?mode=vr` the camera far plane must exceed the sphere radius (500).
+
+Current state (2026-10-22): **everything is built; only the 360 capture
+pipeline is hardware-confirmed.** My next step is the first end-to-end test,
+in this order: (1) page loads + AR session on the Quest, (2) WS connects
 (`python server/run.py --no-serial`), (3) V5 attached with the arm free to
 move safely, (4) arm follows my hand, (5) twin matches reality, (6) gripper —
-benched with the arm motors unpowered first.
+benched with the arm motors unpowered first, (7) `?mode=vr` with the camera.
+
+Planned next, not built: **imitation learning**. It needs a recorder writing
+timestamped (observation, action) tuples — the pieces already exist (pose
+stream out, telemetry back, video). Worth knowing: IL policies want a fixed
+camera view while the operator wants 360, and both can come from the same feed
+by cropping a fixed window out of the equirect. Also planned: more DOF / 3D,
+which needs a third axis in the `p` message and probably moves IK off the V5.
 
 Your job: help me debug whatever the tests turn up. Rules:
 - Fix reported bugs in the existing files; don't restructure or add features
@@ -67,7 +99,5 @@ Your job: help me debug whatever the tests turn up. Rules:
   tracker and regenerate this `HANDOFF.md`.
 - Link lengths L1=20.5, L2=30.5 cm came from my V5 code; if the twin geometry
   looks off, ask me to re-measure instead of guessing.
-- A second workstream (not in this repo) is streaming an Insta360 camera feed
-  into the Quest. If it lands, the heavy video must not share the hotspot with
-  the pose stream, and it has to render inside the existing Three.js scene —
-  the headset can only run one immersive-ar session at a time.
+- Keep the 360 camera optional and isolated. `?mode=ar` must keep working
+  with the camera half stopped, and video must never gate control.

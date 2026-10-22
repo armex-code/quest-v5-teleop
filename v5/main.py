@@ -22,10 +22,13 @@ brain = Brain()
 kill_switch = Bumper(brain.three_wire_port.a)
 reset_switch = Bumper(brain.three_wire_port.b)
 
-# Ports confirmed against the real robot 2026-10-22. These supersede the
-# PORT1 / PORT4 in the inherited khatt-bot program — that code predates the
-# current wiring.
-shoulder_motor = Motor(Ports.PORT12, GearSetting.RATIO_36_1, True)
+# Ports confirmed against the real robot 2026-10-22: shoulder PORT11, elbow
+# PORT20, gripper PORT12. Shoulder and gripper were initially recorded the
+# other way round and corrected the same day — both run 36:1 cartridges, so
+# the swap was ports only and the gearing did not move with it.
+# These supersede the PORT1 / PORT4 in the inherited khatt-bot program, which
+# predates the current wiring.
+shoulder_motor = Motor(Ports.PORT11, GearSetting.RATIO_36_1, True)
 elbow_motor = Motor(Ports.PORT20, GearSetting.RATIO_18_1, False)
 
 GEAR_RATIO = 84 / 12  # external gear ratio = 7
@@ -40,7 +43,7 @@ L_ELBOW = 30.5
 # Closing direction lives in the SIGN of GRIP_CLOSED_DEG. Leave GRIP_REVERSED
 # alone unless the motor is physically mounted mirrored; flipping both just
 # cancels out and the jaws drive the wrong way again.
-GRIP_PORT = Ports.PORT11       # confirmed 2026-10-22
+GRIP_PORT = Ports.PORT12       # corrected 2026-10-22 (was swapped with shoulder)
 GRIP_GEARING = GearSetting.RATIO_36_1   # 36:1 cartridge
 GRIP_REVERSED = False
 GRIP_OPEN_DEG = 0              # = the startup pose
@@ -161,8 +164,17 @@ def calculate_inverse_jacobian_pure(x_target, y_target,
     return None  # signal failure clearly instead of silently returning (0,0)
 
 def normalized_to_workspace(x_norm, y_norm):
-    X_MIN, X_MAX = -10.5, 10.5
-    Y_MIN, Y_MAX = 18, 48
+    # 28 x 28 cm SQUARE, widened from the old 21 x 30 rectangle 2026-10-22.
+    #
+    # Geometry check against the reachable annulus (L1=20.5, L2=30.5, so
+    # reach is 10.0 .. 51.0 cm from the shoulder):
+    #   far corner  (depth 44, lateral 14) -> r = 46.2 cm, 4.8 cm of margin
+    #   nearest pt  (depth 16, lateral 0)  -> r = 16.0 cm, 6.0 cm of margin
+    # Worth noting the OLD rectangle was tighter than this: its far corners
+    # sat at r = 49.1, only 1.9 cm short of full extension. So this is both
+    # 24% more area AND further from the singularity at full stretch.
+    X_MIN, X_MAX = -14.0, 14.0   # lateral
+    Y_MIN, Y_MAX = 16.0, 44.0    # depth
     x_norm = max(0.0, min(1.0, x_norm))
     y_norm = max(0.0, min(1.0, y_norm))
 

@@ -30,6 +30,9 @@ with a Three.js digital twin mirroring real encoder state back into the headset.
 - [ ] M4 — Fixed drawing panel, EMA smoothing, grip flag (built ✅ / confirmed ❌)
 - [ ] M5 — Digital twin + telemetry return path (built ✅ / confirmed ❌)
 - [ ] M6 — Gripper end effector, trigger-driven (built ✅ / confirmed ❌)
+- [ ] M7 — Live 360 camera world for remote operation, `?mode=vr`
+      (built ✅ / **camera pipeline confirmed on hardware ✅** /
+      merged page confirmed in headset ❌)
 
 Suggested first-test order: M1 page alone → WS connect (`--no-serial`) →
 serial with V5 on blocks (motors free) → arm follows the hand → twin accuracy
@@ -52,8 +55,10 @@ serial with V5 on blocks (motors free) → arm follows the hand → twin accurac
   wrong, ask the user to re-measure).
 - Telemetry is the one V5-side addition: `"E,q1,q2,c1,c2\n"` at 20 Hz
   (measured & commanded arm-frame degrees, gear ratio divided out).
-- Motors, **all three ports user-confirmed 2026-10-22**: shoulder **PORT12**
-  (36:1, reversed), elbow **PORT20** (18:1), gripper **PORT11** (36:1).
+- Motors, **all three ports user-confirmed 2026-10-22**: shoulder **PORT11**
+  (36:1, reversed), elbow **PORT20** (18:1), gripper **PORT12** (36:1).
+  Shoulder/gripper were briefly recorded swapped and corrected the same day;
+  both are 36:1, so only the port numbers moved, not the gearing.
   These supersede the PORT1/PORT4 that came from the khatt-bot program — that
   code predates the current wiring, so don't "restore" it. Gear cartridges are
   still khatt-bot-derived and were *not* re-confirmed: if a joint runs at the
@@ -78,20 +83,36 @@ serial with V5 on blocks (motors free) → arm follows the hand → twin accurac
 
 ## Hardware / network facts
 
-- Meta Quest 3S — Meta Quest Browser, WebXR `immersive-ar` (passthrough). HTTPS required.
+- Meta Quest 3S — Meta Quest Browser. HTTPS required. **Two world modes**,
+  chosen with `?mode=` on the page URL; only one immersive session can run at
+  a time, and an opaque 360 sphere covers passthrough completely, so this is a
+  choice and not a combination:
+  - `?mode=ar` (default) — `immersive-ar` passthrough, for when you are in the
+    room with the robot. Sharper, stereo, needs no camera.
+  - `?mode=vr` — `immersive-vr` with a live Insta360 X5 feed as the world, for
+    operating from elsewhere. Panel/twin/HUD/controls are identical.
 - **Host = the user's Windows 11 PC** (a Pi works identically, not needed).
-  Runs `server/run.py`: HTTPS static server (8443) + WSS bridge (8765) +
-  USB serial to the V5 (auto-detected by VEX vendor ID 0x2888, user port).
+  Runs `server/run.py`: HTTPS static server (8443, which also proxies WHEP) +
+  WSS bridge (8765) + USB serial to the V5 (VEX vendor ID 0x2888, user port).
 - Network: campus Wi-Fi isolates clients → use the PC's **Mobile Hotspot**
   (PC IP usually `192.168.137.1`); Quest connects to it. See docs/HTTPS_SETUP.md.
+  `scripts/gen_cert.sh` takes several IPs so one cert covers hotspot + Wi-Fi.
 - VEX V5 Brain over USB. 2 smart motors (shoulder q1, elbow q2 relative).
   Arm is horizontal planar.
+- **Insta360 X5** on USB (optional, `?mode=vr` only). Pick *Webcam Mode* on the
+  camera screen; it re-asks on every replug. DirectShow name `Insta360 X5`,
+  MJPEG only, two formats: 2880×1440@30 (360 equirect — use this) and
+  1920×1080@30 (Reframe, a *flat* view this client would wrongly wrap onto a
+  sphere). `bin/mediamtx.exe` + ffmpeg are driven by `start_camera.ps1`.
 
 ## Architecture
 
 ```
 Quest controller ──WebXR page (quest/)──wss:8765──▶ PC server/run.py ──"u,v,grip"──serial──▶ V5 (IK + P-loop) ──▶ motors + gripper
 Quest twin (ghost+solid) ◀──wss "tm" ◀── PC ◀──"E,q1,q2,c1,c2"──serial ◀── V5 encoders
+
+?mode=vr only — one-way video, carries no robot data:
+Insta360 X5 ──USB──▶ ffmpeg ──rtsp──▶ mediamtx ──whep via run.py:8443──▶ Quest sphere
 ```
 
 ## Conventions (do not drift from these)
@@ -108,6 +129,18 @@ Quest twin (ghost+solid) ◀──wss "tm" ◀── PC ◀──"E,q1,q2,c1,c2"
   link 1), gear ratio divided out.
 - **Rates:** Quest sends ~25 Hz (EMA-smoothed on the Quest). Host acts on the
   **latest** pose only (per-connection `s` sequence numbers). V5 telemetry 20 Hz.
+- **Safe start (do not "helpfully" remove):** the client enters every session
+  **paused**, so the arm cannot move until the user presses X. Paused
+  withholds `u,v` entirely, so the host receives no actionable pose and emits
+  no serial frame at all. Entering live meant the panel landed wherever the
+  user happened to stand and the arm lunged to meet it.
+- **Mode switch:** Y on the left controller ends the session and reloads with
+  the other `?mode=`. A headset runs one immersive session at a time and its
+  type cannot change in place, so a reload is the mechanism, not laziness.
+- **Controller models** are procedural (`makeControllerModel`), with a lit dot
+  per button so the floating card's labels map to something visible.
+  `XRControllerModelFactory` is NOT usable here — it fetches glTF from a CDN
+  and this rig runs on an offline hotspot.
 - **Gripper:** trigger pressed = jaws closed = `1`. If poses go stale
   (`POSE_STALE_S`, 1 s) the host **freezes** the grip value instead of zeroing
   it — never auto-open, because that drops the payload. Same reasoning applies
@@ -117,6 +150,23 @@ Quest twin (ghost+solid) ◀──wss "tm" ◀── PC ◀──"E,q1,q2,c1,c2"
 - Quest page is plain ES modules + Three.js vendored locally
   (`quest/js/vendor/three.module.js`, v0.160.0, wired via the import map in
   `quest/index.html`) so no internet is needed. No build step, ever.
+- **360 camera (`?mode=vr`)** lives entirely in `quest/js/pano.js` +
+  `quest/js/whep.js`; `app.js` only picks the session type and calls into it,
+  so AR behaviour is unchanged by anything the camera does. Facts worth not
+  re-deriving:
+  - WHEP is reverse-proxied through run.py's **own** port so the headset
+    trusts ONE cert. A cross-origin fetch to a second self-signed cert fails
+    with no interstitial — unacceptable inside a headset.
+  - The camera's live ceiling is 2880×1440 ≈ **8 px/degree** vs the headset's
+    ~20. Measured: our H.264 at 35 Mbit is transparent (47.4 dB PSNR) and
+    Wi-Fi drops zero frames, so neither is the bottleneck — the camera
+    downsamples 8K→2880×1440 internally. Don't chase bitrate.
+  - It is **monoscopic**: the X5's lenses are back to back and share no
+    baseline, so stereo depth is impossible in principle, not just unbuilt.
+  - In `?mode=vr` the camera far plane must exceed the sphere radius (500) or
+    the world is clipped to nothing; AR keeps its tight 50 m far plane.
+  - Stand the camera **upright**: lying flat puts the lens stitch seam
+    horizontally across the middle of your view.
 - `websockets` Python lib pinned `<13` (run.py uses the legacy
   `process_request` signature).
 
@@ -124,32 +174,60 @@ Quest twin (ghost+solid) ◀──wss "tm" ◀── PC ◀──"E,q1,q2,c1,c2"
 
 ```
 quest/            WebXR client (static, no build step)
-  index.html      entry + import map + DOM overlay
-  js/app.js       AR session, HUD, WS client, calibration, digital twin
+  index.html      entry + import map + DOM overlay + mode links
+  js/app.js       XR session, HUD, WS client, panel, digital twin
+  js/pano.js      360 camera world (?mode=vr only) — sphere, zoom, reconnect
+  js/whep.js      ~130-line WHEP client, no dependencies
 server/           everything that runs on the host PC (was pi/)
-  run.py          ONE command: HTTPS static + WSS bridge + V5 serial
+  run.py          ONE command: HTTPS static + WHEP proxy + WSS bridge + V5 serial
+  mediamtx.yml    RTSP in (loopback) → WebRTC out; everything else disabled
   certs/          self-signed cert.pem/key.pem (gitignored) — scripts/gen_cert.sh
   requirements.txt
+bin/mediamtx.exe  v1.21.2 (gitignored, 55 MB) — github.com/bluenviron/mediamtx
 v5/main.py        VEXcode V5 Python program (user's IK + telemetry) — deploy via VEXcode
-scripts/gen_cert.sh   self-signed cert for the host IP (run in Git Bash)
+start_camera.ps1  the 360 half: mediamtx + ffmpeg (-Test / -Probe / -AddFirewallRules)
+scripts/gen_cert.sh   self-signed cert; takes SEVERAL IPs (run in Git Bash)
 docs/HTTPS_SETUP.md   hotspot + cert flow + Quest acceptance (both ports!)
-PROTOCOL.md       wire format: WS messages AND serial framing
+PROTOCOL.md       wire format: WS messages, serial framing AND the WHEP link
 HANDOFF.md        ready-to-paste prompt to continue on a smaller model
 ```
 
 ## How to run
 
 ```bash
-./scripts/gen_cert.sh 192.168.137.1      # once (Git Bash); hotspot IP
-pip install -r server/requirements.txt   # once
-python server/run.py                     # everything (add --no-serial to test without V5)
+./scripts/gen_cert.sh 192.168.137.1 10.126.73.140   # once; list every IP you may serve from
+pip install -r server/requirements.txt              # once
+.\start_camera.ps1 -AddFirewallRules                # once, as ADMIN (UDP 8189!)
 ```
+Then, **one command for everything** (page + WS + serial + 360 camera):
+```powershell
+.\start_all.ps1            # or double-click start_all.bat
+.\start_all.ps1 -Test      # generated pattern instead of the camera
+.\start_all.ps1 -NoCamera  # robot side only (old start_server.bat behaviour)
+.\start_all.ps1 -NoSerial  # UI / twin testing with no V5
+.\start_all.ps1 -DeployV5  # also upload v5/main.py to slot 3 first
+.\start_all.ps1 -Force     # kill stale holders of our ports from a previous run
+```
+`start_camera.ps1` still exists for camera-only debugging. Both launchers
+dot-source `scripts/lib_launch.ps1`, which owns the ffmpeg argument list — it
+lives in one place on purpose, since every value in it was measured.
+Keep those scripts **pure ASCII**: PowerShell 5.1 reads BOM-less files as
+ANSI, so a stray em-dash prints as mojibake.
 Deploy `v5/main.py` to the brain from VEXcode and start it **with the gripper
 jaws open** (startup pose = fully open). On the Quest (connected to the PC
 hotspot): accept the cert at `https://<PC_IP>:8443` AND `https://<PC_IP>:8765`,
 then open the first URL → Enter AR → the panel is live immediately (no
 calibration) → move your hand, squeeze the trigger to grip.
 Full walkthrough in docs/HTTPS_SETUP.md.
+
+For the 360 world, additionally (second window):
+
+```powershell
+.\start_camera.ps1 -AddFirewallRules   # once, as administrator (UDP 8189!)
+.\start_camera.ps1                     # -Test for a pattern with no camera
+```
+then open `https://<PC_IP>:8443/?mode=vr`. The HUD's `CAM` chip reports the
+feed; a black world with `CAM live` means UDP 8189 is blocked.
 
 ## Usage-limit / model handoff rule
 

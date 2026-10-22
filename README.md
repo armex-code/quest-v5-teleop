@@ -15,6 +15,27 @@ There is **no Raspberry Pi and no build step**: your Windows PC hosts a static
 HTTPS page and a WebSocket↔serial bridge; the inverse kinematics runs on the
 V5 brain itself (`v5/main.py`, deployed once from VEXcode).
 
+## Two world modes
+
+The page takes a `?mode=` parameter. Panel, twin, HUD and every control are
+identical in both — only what you see *around* them changes.
+
+| mode | world | when |
+|---|---|---|
+| **`?mode=ar`** (default) | passthrough — the actual room | you are next to the robot. Sharper, stereo, no camera needed |
+| **`?mode=vr`** | a live Insta360 X5 360° feed | operating from another room. Needs `start_camera.ps1` too |
+
+Only one immersive session can run at a time, and an opaque 360 sphere covers
+passthrough completely — so this is a choice, not a combination. If you are in
+the same room as the arm, **use AR**: passthrough beats any camera on
+resolution, depth and latency. The 360 feed earns its place the moment you
+cannot see the robot.
+
+```
+?mode=vr only — one-way video, no robot data on this path:
+Insta360 X5 ──USB──▶ ffmpeg ──rtsp──▶ mediamtx ──WHEP via run.py:8443──▶ Quest sphere
+```
+
 ## Documentation map
 
 | file | what's in it |
@@ -29,8 +50,8 @@ V5 brain itself (`v5/main.py`, deployed once from VEXcode).
 
 - Meta Quest 3S (Meta Quest Browser — WebXR `immersive-ar`)
 - Windows PC (the host) with a USB cable to the V5
-- VEX V5 brain: shoulder motor **PORT12** (36:1, reversed), elbow motor
-  **PORT20** (18:1), gripper motor **PORT11** (36:1), external gear ratio
+- VEX V5 brain: shoulder motor **PORT11** (36:1, reversed), elbow motor
+  **PORT20** (18:1), gripper motor **PORT12** (36:1), external gear ratio
   84:12 on the arm, links L1 = 20.5 cm, L2 = 30.5 cm, kill switch on 3-wire
   port A, reset switch on port B
 - Gripper travel is measured: fully open = 0, fully closed = **-237 motor
@@ -45,8 +66,10 @@ V5 brain itself (`v5/main.py`, deployed once from VEXcode).
 1. **Network.** Campus/enterprise Wi-Fi blocks device-to-device traffic, so:
    Windows Settings → **Mobile hotspot** → On, and connect the **Quest** to
    that hotspot. The PC's hotspot IP is normally `192.168.137.1` (`ipconfig`).
-2. **Certificate** (WebXR requires HTTPS). In Git Bash:
-   `./scripts/gen_cert.sh 192.168.137.1`
+2. **Certificate** (WebXR requires HTTPS). In Git Bash — list every address
+   you might serve from and one cert covers them all, so switching between the
+   hotspot and normal Wi-Fi needs no regenerate and no re-accepting on the
+   headset: `./scripts/gen_cert.sh 192.168.137.1 10.126.73.140`
 3. **Python deps:** `pip install -r server/requirements.txt`
 4. **V5 program:** open `v5/main.py` in VEXcode V5, download it to the brain.
 5. **Quest, once per cert:** in the Quest Browser visit
@@ -64,6 +87,34 @@ V5, `-v` to log every pose.)
 
 Then: plug in the V5 and start its program → on the Quest open
 `https://192.168.137.1:8443` → **Enter AR**.
+
+#### …and for the 360 world (`?mode=vr`)
+
+A second window, plus one-time firewall rules:
+
+```powershell
+.\start_camera.ps1 -AddFirewallRules   # once, as ADMINISTRATOR
+.\start_camera.ps1                     # mediamtx + ffmpeg
+.\start_camera.ps1 -Test               # generated pattern, no camera needed
+.\start_camera.ps1 -Probe              # list what the camera offers
+```
+
+Set the X5 to **Webcam Mode** on its own screen (it re-asks on every replug),
+then open `https://192.168.137.1:8443/?mode=vr`.
+
+The firewall step matters more than it looks: **UDP 8189** carries the video
+straight to the headset, bypassing the web server. Forget it and the page
+loads perfectly while the world stays black forever. The HUD's `CAM` chip
+tells you which half is failing.
+
+In VR mode the right controller gains **B** = recentre the 360 view on where
+you are looking, and **right stick ▲▼** = zoom. Zoom magnifies without
+sharpening — WebXR does not let an app change the field of view, so this is
+binoculars rather than a wider lens.
+
+Camera placement is worth more than any setting: stand it **upright** (lying
+flat puts the lens stitch seam horizontally across the middle of your view)
+and **close to the arm** (at 50 cm the arm spans ~480 px; at 3 m, ~80 px).
 
 ### In the headset
 
