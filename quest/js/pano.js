@@ -23,8 +23,13 @@ import * as THREE from 'three';
 import { WhepClient } from './whep.js';
 
 const DEFAULTS = {
-  // Far enough to read as "the world". Lower it (?radius=3) to trade the
-  // rock-steady image for approximate motion parallax at room distance.
+  // Far enough to read as "the world". With the default head-following
+  // anchor this is nearly cosmetic -- the sphere moves with you, so you
+  // cannot see its radius. It only bites together with ?anchor=world, which
+  // pins the sphere so head movement produces parallax; pair that with a
+  // small ?radius (try 3 in a normal room) if you want to experiment. That
+  // parallax is invented, though: the remote camera did not move, so nearer
+  // and farther objects shift by the wrong amount.
   radius: 500,
   // WebXR framebuffer supersampling; the browser often renders below panel
   // resolution and this recovers detail the video genuinely contains.
@@ -47,7 +52,18 @@ export class Pano {
     this.zoom = 1;
     this.yaw = THREE.MathUtils.degToRad(opts.yawDeg || 0);
     this.roll = THREE.MathUtils.degToRad(opts.rollDeg || 0);
+    // Keep the sphere centred on the viewer's eyes. The session uses a
+    // local-floor reference space, so the scene origin is on the FLOOR -- a
+    // sphere left at the origin puts its centre ~1.6 m below your head and
+    // the horizon visibly sinks.
+    //
+    // Following the head is also the physically honest choice: moving your
+    // head here does not move the remote camera, so the view from its optical
+    // centre should not change. Any parallax would be invented.
+    this.followHead = opts.anchor !== 'world';
+    this._anchored = false;
     this._dir = new THREE.Vector3();
+    this._pos = new THREE.Vector3();
     this._quat = new THREE.Quaternion();
 
     this.video = document.createElement('video');
@@ -167,6 +183,19 @@ export class Pano {
 
   /** Call once per frame, after any yaw/roll change. */
   update(activeCamera) {
+    if (this.followHead) {
+      // Centre on the eyes every frame.
+      activeCamera.getWorldPosition(this._pos);
+      this.mesh.position.copy(this._pos);
+    } else if (!this._anchored) {
+      // ?anchor=world: pin it once, at head height rather than on the floor,
+      // so a small ?radius can produce (approximate, invented) parallax
+      // without the horizon starting out below your eyeline.
+      activeCamera.getWorldPosition(this._pos);
+      this.mesh.position.copy(this._pos);
+      this._anchored = true;
+    }
+
     this.mesh.rotation.y = this.yaw;
     this.mesh.rotation.z = this.roll;
     this.uniforms.uZoom.value = this.zoom;

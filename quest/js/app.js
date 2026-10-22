@@ -231,6 +231,7 @@ function initScene() {
     fbScale: parseFloat(params.get('fbscale')) || undefined,
     yawDeg: parseFloat(params.get('yaw')) || 0,
     rollDeg: parseFloat(params.get('roll')) || 0,
+    anchor: params.get('anchor') || 'head',
   });
   pano.mesh.visible = false;
 

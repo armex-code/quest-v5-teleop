@@ -163,8 +163,15 @@ Insta360 X5 ──USB──▶ ffmpeg ──rtsp──▶ mediamtx ──whep vi
     downsamples 8K→2880×1440 internally. Don't chase bitrate.
   - It is **monoscopic**: the X5's lenses are back to back and share no
     baseline, so stereo depth is impossible in principle, not just unbuilt.
-  - In `?mode=vr` the camera far plane must exceed the sphere radius (500) or
-    the world is clipped to nothing; AR keeps its tight 50 m far plane.
+  - The camera far plane must exceed the sphere radius (500) or the world is
+    clipped to nothing.
+  - The pano sphere **follows the head position every frame**. The session
+    uses a `local-floor` reference space, so the scene origin is on the
+    FLOOR — leaving the sphere at the origin puts its centre ~1.6 m below
+    your eyes and the horizon visibly sinks. Following is also the honest
+    choice: moving your head does not move the remote camera, so the view
+    from its optical centre must not change. `?anchor=world` pins it instead,
+    for the (invented) parallax experiment with a small `?radius`.
   - Stand the camera **upright**: lying flat puts the lens stitch seam
     horizontally across the middle of your view.
 - `websockets` Python lib pinned `<13` (run.py uses the legacy
