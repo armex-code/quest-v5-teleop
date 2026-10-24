@@ -675,6 +675,9 @@ function buildPanel() {
 
   const group = new THREE.Group();
   group.position.set(...(old ? old.group.position.toArray() : PANEL_POS));
+  // Keep the alignment you dialled in when cfg changes rebuild the panel.
+  const yaw = old ? old.yaw : 0;
+  group.rotation.y = yaw;
 
   const fill = new THREE.Mesh(
     new THREE.PlaneGeometry(w, d),
@@ -746,28 +749,51 @@ function buildPanel() {
   group.add(cursor);
 
   scene.add(group);
-  panel = { group, cursor, halfW, halfD };
+  panel = { group, cursor, halfW, halfD, yaw };
 }
 
 function movePanelTo(x, y, z) {
   if (panel) panel.group.position.set(x, y, z);
 }
 
-function panelUV() {
-  if (!panel || !ema) return null;
+function rotatePanel(delta) {
+  if (!panel) return;
+  panel.yaw += delta;
+  panel.group.rotation.y = panel.yaw;
+}
+
+/**
+ * Controller position in the panel's OWN frame.
+ *
+ * Must undo the panel's yaw: u/v are fractions along the panel's edges, so
+ * once it can be rotated, world-axis deltas are simply the wrong numbers.
+ * Skipping this is a silent failure -- the arm keeps moving, just not where
+ * your hand says.
+ */
+function panelLocal() {
   const px = ema.x - panel.group.position.x;
   const pz = ema.z - panel.group.position.z;
+  const c = Math.cos(panel.yaw);
+  const s = Math.sin(panel.yaw);
+  return { x: px * c - pz * s, z: px * s + pz * c };
+}
+
+function panelUV() {
+  if (!panel || !ema) return null;
+  const p = panelLocal();
   // u = depth fraction (near edge 0 → far edge 1), v = lateral (left 0 → right 1)
-  const u = clamp01((panel.halfD - pz) / (2 * panel.halfD));
-  const v = clamp01((px + panel.halfW) / (2 * panel.halfW));
+  const u = clamp01((panel.halfD - p.z) / (2 * panel.halfD));
+  const v = clamp01((p.x + panel.halfW) / (2 * panel.halfW));
   return { u, v };
 }
 
 function updatePanelCursor() {
   if (!panel || !panel.cursor || !ema) return;
-  const px = Math.max(-panel.halfW, Math.min(panel.halfW, ema.x - panel.group.position.x));
-  const pz = Math.max(-panel.halfD, Math.min(panel.halfD, ema.z - panel.group.position.z));
-  panel.cursor.position.set(px, 0.006, pz);
+  const p = panelLocal();
+  panel.cursor.position.set(
+    Math.max(-panel.halfW, Math.min(panel.halfW, p.x)),
+    0.006,
+    Math.max(-panel.halfD, Math.min(panel.halfD, p.z)));
   panel.cursor.material.color.setHex(
     paused ? 0x8e8e93 : gripNow ? 0xff3b30 : 0xffffff);
 }
@@ -860,6 +886,13 @@ function onFrame(time, frame) {
         if (risingEdge('right', 4, btn(4))) movePanelTo(p.x, p.y, p.z); // A
         if (risingEdge('right', 3, btn(3))) clearTrail(); // stick click
 
+        // Stick ◄ ► aligns the drawing panel with the real robot. Without
+        // this the panel can only be placed, not aimed, which makes matching
+        // its axes to the arm's a matter of standing in exactly the right
+        // spot.
+        const panX = gp.axes[2] || 0;
+        if (Math.abs(panX) > 0.15) rotatePanel(-panX * 0.022);
+
         // 360-camera controls, only while that world is actually showing —
         // otherwise they would silently swallow the right stick in passthrough.
         let zoomY = 0;
@@ -876,6 +909,7 @@ function onFrame(time, frame) {
           const rows = [
             ['Trigger', gripNow ? 'GRIPPING' : 'close gripper', trigger],
             ['A', 'move panel here', btn(4)],
+            ['Stick ◄ ►', 'aim panel', Math.abs(panX) > 0.15],
             ['Stick press', 'clear trail', btn(3)],
           ];
           if (panoShown) {
@@ -895,9 +929,15 @@ function onFrame(time, frame) {
         if (btn(1) && twin) { // grip held → carry the twin
           twin.group.position.set(p.x, p.y, p.z);
         }
-        // Thumbstick left/right rotates the twin to match the real robot.
+        // Thumbstick ◄ ► rotates the twin; holding the trigger makes the same
+        // stick turn the 360 feed instead. Both are yaw, so they belong on
+        // the same axis -- and the trigger is the only free input left that
+        // keeps them there rather than exiling one onto the vertical axis.
         const ax = gp.axes[2] || 0;
-        if (Math.abs(ax) > 0.5 && twin) {
+        const turningPano = trigger && panoShown;
+        if (Math.abs(ax) > 0.15 && turningPano) {
+          pano.yaw -= ax * 0.022;
+        } else if (Math.abs(ax) > 0.5 && twin) {
           twinYaw -= ax * 0.02; // ~80°/s at 72 fps
           twin.group.rotation.y = twinYaw;
         }
@@ -906,12 +946,17 @@ function onFrame(time, frame) {
         if (card) {
           card.sp.position.set(p.x, p.y + 0.11, p.z);
           card.sp.visible = true;
-          drawCtlCard(card, 'LEFT — the twin', [
+          const lrows = [
             ['X', paused ? 'GO LIVE' : 'pause', btn(4)],
             ['Y', panoShown ? 'back to passthrough' : 'show 360 camera', btn(5)],
             ['Grip (hold)', 'move twin', btn(1)],
-            ['Stick ◄ ►', 'rotate twin', Math.abs(ax) > 0.5],
-          ]);
+            ['Stick ◄ ►', turningPano ? 'TURN 360 VIEW' : 'rotate twin',
+              Math.abs(ax) > 0.15],
+          ];
+          if (panoShown) {
+            lrows.push(['Trigger+stick', 'turn 360 view', trigger]);
+          }
+          drawCtlCard(card, 'LEFT — the twin', lrows);
         }
       }
     }

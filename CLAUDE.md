@@ -140,6 +140,11 @@ Insta360 X5 ──USB──▶ ffmpeg ──rtsp──▶ mediamtx ──whep vi
   hardware) then forwards; the V5's `normalized_to_workspace()` maps to arm cm
   inside the reachable annulus — no host-side clamp needed. Twin orientation:
   TWIN_Q_SIGN / TWIN_YAW_DEG in quest/js/app.js, left stick rotates live.
+- **Panel aiming:** the panel can be rotated (right stick ◄ ►) as well as
+  placed, so you can line its axes up with the real arm without standing in
+  exactly the right spot. `panelLocal()` undoes that yaw before computing
+  u/v — skip it and the arm keeps moving but not where your hand says, which
+  is a silent failure. Yaw survives `cfg`-driven rebuilds.
 - **Angles:** degrees over the wire, arm frame (q1 at shoulder, q2 relative to
   link 1), gear ratio divided out.
 - **Twin:** links are extruded rounded beams, joints are cylinders on the
