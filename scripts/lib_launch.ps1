@@ -136,6 +136,141 @@ function Sync-V5Program([string] $root, [int] $slot = 3) {
   return 'uploaded'
 }
 
+<#
+One screen telling you whether this machine is ready, and for anything that
+is not, what to do about it. Every failure mode we have actually hit lives
+here, because "it loads but the world is black" is miserable to diagnose
+from inside a headset and trivial to catch from outside one.
+
+Returns $true if nothing is outright broken (warnings are fine).
+#>
+function Show-Preflight([string] $root, [switch] $NoCamera, [switch] $NoSerial,
+                        [string] $Device = 'Insta360 X5') {
+  $rows = @()
+  $fatal = $false
+  function Row($state, $name, $detail) {
+    $script:rows += [pscustomobject]@{ S = $state; N = $name; D = $detail }
+  }
+  $script:rows = @()
+
+  # --- certificate: present, in date, and covering the IP we will serve on --
+  $ip = Get-HostIp
+  $certPath = Join-Path $root 'server\certs\cert.pem'
+  if (-not (Test-Path $certPath)) {
+    Row 'FAIL' 'certificate' "missing -> ./scripts/gen_cert.sh $ip"
+    $fatal = $true
+  } else {
+    try {
+      $c = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certPath)
+      $san = ($c.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.17' })
+      $txt = if ($san) { $san.Format($false) } else { '' }
+      $days = [int]($c.NotAfter - (Get-Date)).TotalDays
+      if ($days -lt 0) {
+        Row 'FAIL' 'certificate' "EXPIRED -> ./scripts/gen_cert.sh $ip"; $fatal = $true
+      } elseif ($txt -notmatch [regex]::Escape($ip)) {
+        # The single most common silent failure after switching networks.
+        Row 'WARN' 'certificate' "does NOT cover $ip -> ./scripts/gen_cert.sh $ip"
+      } else {
+        Row 'OK' 'certificate' "covers $ip, $days days left"
+      }
+    } catch {
+      Row 'WARN' 'certificate' 'present but unreadable'
+    }
+  }
+
+  # --- tools -------------------------------------------------------------
+  # No 2>&1 on these either, for the same reason as the camera probe below.
+  if (Get-Command python -EA SilentlyContinue) {
+    Row 'OK' 'python' ((& python --version | Out-String).Trim())
+  } else { Row 'FAIL' 'python' 'not on PATH'; $fatal = $true }
+
+  if (-not $NoCamera) {
+    $ff = Get-Command ffmpeg -EA SilentlyContinue
+    if ($ff) {
+      $v = ((& ffmpeg -version | Select-Object -First 1) -split ' ')[2]
+      Row 'OK' 'ffmpeg' "v$v"
+    } else { Row 'FAIL' 'ffmpeg' 'not on PATH'; $fatal = $true }
+
+    if (Test-Path (Join-Path $root 'bin\mediamtx.exe')) { Row 'OK' 'mediamtx' 'bin\mediamtx.exe' }
+    else { Row 'FAIL' 'mediamtx' 'missing -> unzip release into bin\'; $fatal = $true }
+  }
+
+  # --- firewall ----------------------------------------------------------
+  $have = @($script:FW_RULES | Where-Object {
+    Get-NetFirewallRule -DisplayName $_.Name -EA SilentlyContinue }).Count
+  if ($have -eq $script:FW_RULES.Count) { Row 'OK' 'firewall' "$have/$($script:FW_RULES.Count) rules" }
+  else { Row 'WARN' 'firewall' "$have/$($script:FW_RULES.Count) -> will prompt for admin once (UDP 8189 carries the video)" }
+
+  # --- V5 brain ----------------------------------------------------------
+  if ($NoSerial) {
+    Row 'WARN' 'V5 brain' 'skipped (-NoSerial)'
+  } else {
+    $vex = @(Get-CimInstance Win32_PnPEntity -EA SilentlyContinue |
+             Where-Object { $_.PNPDeviceID -match 'VID_2888' -and $_.Name -match 'COM(\d+)' })
+    if ($vex.Count -ge 2) {
+      $ports = ($vex | ForEach-Object { if ($_.Name -match 'COM(\d+)') { 'COM' + $Matches[1] } }) -join ' '
+      Row 'OK' 'V5 brain' "$ports (admin + user)"
+    } elseif ($vex.Count -eq 1) {
+      Row 'WARN' 'V5 brain' 'only one port seen - brain may still be booting'
+    } else {
+      Row 'WARN' 'V5 brain' 'not detected -> plug in USB and power on'
+    }
+  }
+
+  # --- camera ------------------------------------------------------------
+  if (-not $NoCamera) {
+    # ffmpeg prints the device list on STDERR and exits non-zero (there is no
+    # real input). Piping that through 2>&1 would make PowerShell wrap each
+    # line in an ErrorRecord, which under ErrorActionPreference='Stop' aborts
+    # the whole script -- so redirect to a file instead and read it back.
+    $tmp = [IO.Path]::GetTempFileName()
+    try {
+      Start-Process ffmpeg -ArgumentList '-hide_banner -f dshow -list_devices true -i dummy' `
+        -NoNewWindow -Wait -RedirectStandardError $tmp | Out-Null
+      $devs = Get-Content $tmp -Raw -ErrorAction SilentlyContinue
+    } catch { $devs = '' } finally { Remove-Item $tmp -Force -EA SilentlyContinue }
+    if ($devs -and $devs -match [regex]::Escape($Device)) {
+      Row 'OK' 'camera' "'$Device' present"
+    } else {
+      Row 'WARN' 'camera' "'$Device' not found -> pick Webcam Mode on the camera screen"
+    }
+  }
+
+  # --- network -----------------------------------------------------------
+  $ssid = (netsh wlan show interfaces 2>$null | Select-String '^\s*SSID\s*:' |
+           Select-Object -First 1)
+  $ssidTxt = if ($ssid) { ($ssid.Line -split ':', 2)[1].Trim() } else { 'wired/unknown' }
+  if ($ip -like '192.168.137.*') {
+    Row 'OK' 'network' "Mobile Hotspot, $ip"
+  } else {
+    Row 'WARN' 'network' "$ssidTxt ($ip) - if the Quest cannot reach this PC, use Mobile Hotspot"
+  }
+
+  # --- ports -------------------------------------------------------------
+  $tcp = @(8443, 8765); if (-not $NoCamera) { $tcp += @(8554, 8889) }
+  $busy = @($tcp | Where-Object { Get-NetTCPConnection -State Listen -LocalPort $_ -EA SilentlyContinue })
+  if ($busy) { Row 'WARN' 'ports' (($busy -join ', ') + ' in use -> re-run with -Force') }
+  else { Row 'OK' 'ports' 'all free' }
+
+  # --- render ------------------------------------------------------------
+  Say ''
+  Say '  SETUP CHECK' 'White'
+  Say '  ---------------------------------------------------------------' 'DarkGray'
+  foreach ($r in $script:rows) {
+    $tag, $col = switch ($r.S) {
+      'OK'   { '[ OK ]', 'Green' }
+      'WARN' { '[WARN]', 'Yellow' }
+      default { '[FAIL]', 'Red' }
+    }
+    Write-Host ("  {0} {1,-13}" -f $tag, $r.N) -ForegroundColor $col -NoNewline
+    Write-Host (" " + $r.D) -ForegroundColor DarkGray
+  }
+  Say '  ---------------------------------------------------------------' 'DarkGray'
+  Say ("  headset URL    https://{0}:8443" -f $ip) 'Cyan'
+  Say ''
+  return -not $fatal
+}
+
 function Find-Vexcom {
   $root = Join-Path $env:APPDATA 'Code\User\globalStorage\vexrobotics.vexcode\tools\vexcom'
   if (-not (Test-Path $root)) { return $null }

@@ -58,7 +58,8 @@ param(
   [switch] $NoDeploy,             # don't upload v5/main.py even if it changed
   [switch] $NoFirewall,           # don't offer to add the inbound rules
   [switch] $ShowFfmpeg,
-  [switch] $Force                 # kill stale holders of our ports
+  [switch] $Force,                # kill stale holders of our ports
+  [switch] $Check                 # run the setup check and exit, start nothing
 )
 
 $ErrorActionPreference = 'Stop'
@@ -68,25 +69,12 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $mediamtx = Join-Path $root 'bin\mediamtx.exe'
 $procs = @()
 
-Say ''
-Say '  Quest -> V5 teleop' 'White'
-Say '  ------------------' 'DarkGray'
-
 # ---------------------------------------------------------------- preflight --
-if (-not (Test-Path (Join-Path $root 'server\certs\cert.pem'))) {
-  $ip = Get-HostIp
-  Say "  error: no TLS certificate in server\certs\" 'Red'
-  Say "         generate one in Git Bash:  ./scripts/gen_cert.sh $ip" 'Yellow'
-  exit 1
-}
-foreach ($t in @('python') + $(if ($NoCamera) { @() } else { @('ffmpeg') })) {
-  if (-not (Get-Command $t -ErrorAction SilentlyContinue)) {
-    Say "  error: '$t' is not on PATH" 'Red'; exit 1
-  }
-}
-if (-not $NoCamera -and -not (Test-Path $mediamtx)) {
-  Say "  error: missing $mediamtx" 'Red'
-  Say "         unzip mediamtx_v1.21.2_windows_amd64.zip into bin\" 'Yellow'
+# One screen saying what is and is not ready, before anything starts.
+$ok = Show-Preflight $root -NoCamera:$NoCamera -NoSerial:$NoSerial -Device $Device
+if ($Check) { exit $(if ($ok) { 0 } else { 1 }) }
+if (-not $ok) {
+  Say '  Fix the [FAIL] rows above and try again.' 'Red'
   exit 1
 }
 
